@@ -169,6 +169,7 @@ async fn audits(State(s): State<Shared>, Path((owner, name)): Path<(String, Stri
                     author: m.author.as_ref().and_then(|a| a.github_login.as_deref()),
                     changes: m.snapshot.changes.len() as i64,
                     gaps: m.gaps.len() as i64,
+                    checkpoints: repo.checkpoint_count(&x.id) as i64,
                     gap_codes: &codes,
                     parents: &m.parents,
                 },

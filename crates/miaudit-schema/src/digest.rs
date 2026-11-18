@@ -8,6 +8,7 @@ pub const DOMAIN_DECISION: &str = "auditAI/decision/v1";
 pub const DOMAIN_EVIDENCE: &str = "auditAI/evidence/v1";
 pub const DOMAIN_BINDING: &str = "auditAI/git-binding/v1";
 pub const DOMAIN_EVENT: &str = "auditAI/event/v1";
+pub const DOMAIN_CHECKPOINT: &str = "auditAI/checkpoint/v1";
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))

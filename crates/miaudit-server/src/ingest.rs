@@ -3,7 +3,7 @@ use miaudit_schema::{
     canonical::to_canonical_bytes,
     digest::{DOMAIN_CONTEXT, DOMAIN_DECISION, DOMAIN_EVIDENCE, content_id, domain_digest},
     input::{ContextInput, DecisionInput},
-    model::{EvidenceBody, Manifest, Stored, StoredBinding, Tree, snapshot_id, tree_digest},
+    model::{EvidenceBody, Manifest, Stored, StoredBinding, StoredCheckpoint, Tree, snapshot_id, tree_digest},
 };
 use serde_json::Value;
 
@@ -37,6 +37,10 @@ pub fn valid_digest(d: &str) -> bool {
 
 pub fn valid_object_id(id: &str) -> bool {
     ["ctx_", "dec_", "evd_"].iter().any(|p| id.strip_prefix(p).is_some_and(hex64))
+}
+
+pub fn valid_checkpoint_id(id: &str) -> bool {
+    id.strip_prefix("chk_").is_some_and(hex64)
 }
 
 pub fn valid_binding_id(id: &str) -> bool {
@@ -123,6 +127,20 @@ pub fn check_binding(id: &str, bytes: &[u8]) -> Result<StoredBinding, Rejection>
         return reject("ID_MISMATCH", "binding does not hash to its id");
     }
     Ok(b)
+}
+
+pub fn check_checkpoint(id: &str, bytes: &[u8]) -> Result<StoredCheckpoint, Rejection> {
+    if !valid_checkpoint_id(id) {
+        return reject("BAD_ID", "checkpoint id must be chk_ followed by 64 hex");
+    }
+    let c: StoredCheckpoint = serde_json::from_slice(bytes).map_err(|e| Rejection { code: "SCHEMA_VIOLATION", message: e.to_string() })?;
+    if c.checkpoint_id != id || c.body.checkpoint_id().ok().as_deref() != Some(id) {
+        return reject("ID_MISMATCH", "checkpoint does not hash to its id");
+    }
+    if !valid_digest(&c.body.events_blob) || !valid_audit_id(&c.body.audit_id) {
+        return reject("BAD_DIGEST", "checkpoint refers to a malformed audit id or events digest");
+    }
+    Ok(c)
 }
 
 #[cfg(test)]

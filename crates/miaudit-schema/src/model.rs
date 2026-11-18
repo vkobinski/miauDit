@@ -1,7 +1,7 @@
 use crate::{
     SCHEMA_VERSION,
     canonical::{CanonError, C14N_VERSION, to_canonical_bytes},
-    digest::{DOMAIN_AUDIT_COMMIT, DOMAIN_BINDING, DOMAIN_TREE, domain_digest},
+    digest::{DOMAIN_AUDIT_COMMIT, DOMAIN_BINDING, DOMAIN_CHECKPOINT, DOMAIN_TREE, domain_digest},
     input::{Classification, ContextInput, DecisionInput},
 };
 use serde::{Deserialize, Serialize};
@@ -309,6 +309,47 @@ pub struct StoredBinding {
     pub created: Created,
 }
 
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointSummary {
+    pub prompts: u64,
+    pub assistant_messages: u64,
+    pub commands: u64,
+    pub resources: u64,
+    pub agent_events: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointBody {
+    pub schema_version: String,
+    pub kind: String,
+    pub audit_id: String,
+    pub previous: Option<String>,
+    pub events_blob: String,
+    pub events_count: u64,
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub first_prev: Option<String>,
+    pub last_event: String,
+    pub summary: CheckpointSummary,
+    pub provenance: Provenance,
+}
+
+impl CheckpointBody {
+    pub fn checkpoint_id(&self) -> Result<String, CanonError> {
+        Ok(format!("chk_{}", domain_digest(DOMAIN_CHECKPOINT, &to_canonical_bytes(self)?)))
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct StoredCheckpoint {
+    pub checkpoint_id: String,
+    pub body: CheckpointBody,
+    pub created: Created,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +441,32 @@ mod tests {
         assert_eq!(round, with_pr);
         let old: GitBindingBody = serde_json::from_str(&text).unwrap();
         assert_eq!(old.pull_request, None);
+    }
+
+    #[test]
+    fn checkpoint_ids_are_deterministic_cover_every_field_and_never_touch_the_audit_id() {
+        let body = |last: u64, previous: Option<&str>| CheckpointBody {
+            schema_version: "1".into(),
+            kind: "checkpoint".into(),
+            audit_id: manifest().audit_id().unwrap(),
+            previous: previous.map(String::from),
+            events_blob: "sha256:aa".into(),
+            events_count: 3,
+            first_seq: 1,
+            last_seq: last,
+            first_prev: None,
+            last_event: "evt_x".into(),
+            summary: CheckpointSummary { prompts: 1, assistant_messages: 1, commands: 1, resources: 0, agent_events: 0 },
+            provenance: Provenance::Observed,
+        };
+        let a = body(3, None).checkpoint_id().unwrap();
+        assert_eq!(a, body(3, None).checkpoint_id().unwrap());
+        assert!(a.starts_with("chk_"));
+        assert_ne!(a, body(4, None).checkpoint_id().unwrap());
+        assert_ne!(a, body(3, Some("chk_y")).checkpoint_id().unwrap());
+        assert_eq!(manifest().audit_id().unwrap(), "audit_7491ebfee4a974198f4b527b1023bee57c4d950a67dd860a9808352c50a6a590", "attaching checkpoints never changes the audit it points at");
+        let round: CheckpointBody = serde_json::from_slice(&serde_json::to_vec(&body(3, None)).unwrap()).unwrap();
+        assert_eq!(round, body(3, None));
     }
 
     #[test]

@@ -5,9 +5,9 @@ use miaudit_schema::{
     digest::sha256_hex,
     input::DecisionInput,
     media::image_mime,
-    model::{EvidenceBody, Manifest, Stored, StoredBinding},
+    model::{EvidenceBody, Manifest, Stored, StoredBinding, StoredCheckpoint},
 };
-use miaudit_ui::data::{EvidenceView, Item, Superseded, View};
+use miaudit_ui::data::{EvidenceView, Item, Superseded, TimelineGroup, View, events_of};
 use mongodb::{
     Client, Collection, Database, IndexModel,
     bson::{Binary, Document, doc, spec::BinarySubtype},
@@ -93,6 +93,16 @@ struct BlobMeta {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+struct CheckpointDoc {
+    repo_id: String,
+    checkpoint_id: String,
+    audit_id: String,
+    raw: String,
+    created_at: String,
+    first_seq: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct BindingDoc {
     repo_id: String,
     binding_id: String,
@@ -125,6 +135,7 @@ pub struct Db {
     objects: Collection<ObjectDoc>,
     blobs: Collection<BlobDoc>,
     bindings: Collection<BindingDoc>,
+    checkpoints: Collection<CheckpointDoc>,
     tokens: Collection<TokenDoc>,
 }
 
@@ -163,6 +174,7 @@ impl Db {
             objects: db.collection("objects"),
             blobs: db.collection("blobs"),
             bindings: db.collection("bindings"),
+            checkpoints: db.collection("checkpoints"),
             tokens: db.collection("tokens"),
         };
         s.repos.create_indexes([idx(doc! {"slug": 1}, true)]).await?;
@@ -176,6 +188,7 @@ impl Db {
         s.objects.create_indexes([idx(doc! {"repo_id": 1, "id": 1}, true)]).await?;
         s.blobs.create_indexes([idx(doc! {"repo_id": 1, "digest": 1}, true)]).await?;
         s.bindings.create_indexes([idx(doc! {"repo_id": 1, "binding_id": 1}, true), idx(doc! {"repo_id": 1, "audit_id": 1}, false)]).await?;
+        s.checkpoints.create_indexes([idx(doc! {"repo_id": 1, "checkpoint_id": 1}, true), idx(doc! {"repo_id": 1, "audit_id": 1, "created_at": 1}, false)]).await?;
         s.tokens.create_indexes([idx(doc! {"hash": 1}, true), idx(doc! {"name": 1}, true)]).await?;
         s.backfill_gap_codes().await?;
         Ok(s)
@@ -376,6 +389,47 @@ impl Db {
         Ok(true)
     }
 
+    pub async fn put_checkpoint(&self, repo_id: &str, id: &str, bytes: &[u8]) -> R<bool> {
+        let c = ingest::check_checkpoint(id, bytes)?;
+        self.require_repo(repo_id).await?;
+        if self.audits.count_documents(doc! {"repo_id": repo_id, "audit_id": &c.body.audit_id}).limit(1).await? == 0 {
+            return Err(DbError::Conflict(format!("audit commit {} has not been pushed to this repo yet", c.body.audit_id)));
+        }
+        if self.checkpoints.count_documents(doc! {"repo_id": repo_id, "checkpoint_id": id}).limit(1).await? > 0 {
+            return Ok(false);
+        }
+        let raw = String::from_utf8(bytes.to_vec()).map_err(|_| Rejection { code: "BAD_JSON", message: "not UTF-8".into() })?;
+        let d = CheckpointDoc { repo_id: repo_id.into(), checkpoint_id: id.into(), audit_id: c.body.audit_id.clone(), raw, created_at: c.created.at.clone(), first_seq: c.body.first_seq as i64 };
+        self.insert_new(&self.checkpoints, d).await?;
+        self.touch(repo_id).await?;
+        Ok(true)
+    }
+
+    pub async fn checkpoint_counts(&self, repo_id: &str, audit_ids: &[String]) -> R<std::collections::HashMap<String, i64>> {
+        let mut out = std::collections::HashMap::new();
+        if audit_ids.is_empty() {
+            return Ok(out);
+        }
+        let mut c = self
+            .checkpoints
+            .clone_with_type::<Document>()
+            .aggregate([
+                doc! {"$match": {"repo_id": repo_id, "audit_id": {"$in": audit_ids}}},
+                doc! {"$group": {"_id": "$audit_id", "n": {"$sum": 1}}},
+            ])
+            .await?;
+        while let Some(d) = c.try_next().await? {
+            let n = d.get_i32("n").map(i64::from).or_else(|_| d.get_i64("n")).unwrap_or(0);
+            out.insert(d.get_str("_id").unwrap_or_default().to_string(), n);
+        }
+        Ok(out)
+    }
+
+    async fn checkpoints_for(&self, repo_id: &str, audit_id: &str) -> R<Vec<StoredCheckpoint>> {
+        let docs: Vec<CheckpointDoc> = self.checkpoints.find(doc! {"repo_id": repo_id, "audit_id": audit_id}).sort(doc! {"created_at": 1, "first_seq": 1}).await?.try_collect().await?;
+        Ok(docs.into_iter().filter_map(|d| serde_json::from_str(&d.raw).ok()).collect())
+    }
+
     async fn insert_new<T: Serialize + Send + Sync>(&self, c: &Collection<T>, d: T) -> R<()> {
         match c.insert_one(d).await {
             Ok(_) => Ok(()),
@@ -391,7 +445,7 @@ impl Db {
         Ok(())
     }
 
-    pub async fn missing(&self, repo_id: &str, commits: &[String], objects: &[String], blobs: &[String], bindings: &[String]) -> R<[Vec<String>; 4]> {
+    pub async fn missing(&self, repo_id: &str, commits: &[String], objects: &[String], blobs: &[String], bindings: &[String], checkpoints: &[String]) -> R<[Vec<String>; 5]> {
         async fn absent<T: Send + Sync + serde::de::DeserializeOwned + Unpin>(c: &Collection<T>, repo_id: &str, field: &str, ids: &[String]) -> R<Vec<String>> {
             if ids.is_empty() {
                 return Ok(vec![]);
@@ -411,6 +465,7 @@ impl Db {
             absent(&self.objects, repo_id, "id", objects).await?,
             absent(&self.blobs, repo_id, "digest", blobs).await?,
             absent(&self.bindings, repo_id, "binding_id", bindings).await?,
+            absent(&self.checkpoints, repo_id, "checkpoint_id", checkpoints).await?,
         ])
     }
 
@@ -514,6 +569,16 @@ impl Db {
         Ok(image_mime(&bytes).map(|m| (m, bytes)))
     }
 
+    async fn timeline_group(&self, repo_id: &str, source: &'static str, id: String, created_at: Option<String>, summary: Option<serde_json::Value>, digest: &str) -> R<TimelineGroup> {
+        Ok(match self.blob_bytes(repo_id, digest).await? {
+            Some(bytes) => {
+                let (events, truncated) = events_of(&bytes);
+                TimelineGroup { source, id, created_at, summary, state: "present", events, truncated }
+            }
+            None => TimelineGroup { source, id, created_at, summary, state: "events unavailable", events: vec![], truncated: false },
+        })
+    }
+
     pub async fn load_view(&self, repo_id: &str, audit_id: &str) -> R<Option<(View, Vec<(String, String, String)>, Superseded)>> {
         let Some(raw) = self.raw_commit(repo_id, audit_id).await? else { return Ok(None) };
         let Ok(m) = serde_json::from_str::<Manifest>(&raw) else { return Ok(None) };
@@ -584,7 +649,24 @@ impl Db {
             add("evidence_artifacts", None, format!("{unavailable} artifact(s) not on the server"));
         }
 
+        let checkpoints = self.checkpoints_for(repo_id, audit_id).await?;
+        let mut timeline: Vec<TimelineGroup> = Vec::new();
+        for e in &evidence {
+            if let Some(o) = e.object.as_ref().filter(|o| o.provenance == miaudit_schema::model::Provenance::Observed) {
+                timeline.push(self.timeline_group(repo_id, "audit", e.id.clone(), Some(m.created.at.clone()), None, &o.body.artifact.digest).await?);
+            }
+        }
+        for c in &checkpoints {
+            timeline.push(self.timeline_group(repo_id, "checkpoint", c.checkpoint_id.clone(), Some(c.created.at.clone()), serde_json::to_value(&c.body.summary).ok(), &c.body.events_blob).await?);
+        }
+        let missing_events = timeline.iter().filter(|g| g.state != "present").count();
+        if missing_events > 0 {
+            add("events_available", None, format!("{missing_events} event blob(s) not on the server"));
+        } else if !timeline.is_empty() {
+            add("events_available", Some(true), format!("{} event group(s) present", timeline.len()));
+        }
         let view = View {
+            timeline,
             id: audit_id.into(),
             manifest: m.clone(),
             bindings,

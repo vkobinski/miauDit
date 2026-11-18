@@ -36,6 +36,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/repos/{repo_id}/objects/{id}", put(put_object))
         .route("/api/v1/repos/{repo_id}/commits/{id}", put(put_commit))
         .route("/api/v1/repos/{repo_id}/bindings/{id}", put(put_binding))
+        .route("/api/v1/repos/{repo_id}/checkpoints/{id}", put(put_checkpoint))
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     let read = Router::new()
@@ -151,14 +152,15 @@ struct Have {
     objects: Vec<String>,
     blobs: Vec<String>,
     bindings: Vec<String>,
+    checkpoints: Vec<String>,
 }
 
 async fn have(State(s): State<Shared>, Path(repo_id): Path<String>, Json(b): Json<Have>) -> Response {
-    if b.commits.len() + b.objects.len() + b.blobs.len() + b.bindings.len() > 50_000 {
+    if b.commits.len() + b.objects.len() + b.blobs.len() + b.bindings.len() + b.checkpoints.len() > 50_000 {
         return api_error(StatusCode::PAYLOAD_TOO_LARGE, "TOO_MANY", "at most 50000 ids per request");
     }
-    match s.db.missing(&repo_id, &b.commits, &b.objects, &b.blobs, &b.bindings).await {
-        Ok([commits, objects, blobs, bindings]) => Json(json!({"missing": {"commits": commits, "objects": objects, "blobs": blobs, "bindings": bindings}})).into_response(),
+    match s.db.missing(&repo_id, &b.commits, &b.objects, &b.blobs, &b.bindings, &b.checkpoints).await {
+        Ok([commits, objects, blobs, bindings, checkpoints]) => Json(json!({"missing": {"commits": commits, "objects": objects, "blobs": blobs, "bindings": bindings, "checkpoints": checkpoints}})).into_response(),
         Err(e) => db_error(e),
     }
 }
@@ -178,6 +180,9 @@ async fn put_object(State(s): State<Shared>, Path((repo_id, id)): Path<(String, 
 }
 async fn put_commit(State(s): State<Shared>, Path((repo_id, id)): Path<(String, String)>, body: Bytes) -> Response {
     stored(s.db.put_commit(&repo_id, &id, &body).await)
+}
+async fn put_checkpoint(State(s): State<Shared>, Path((repo_id, id)): Path<(String, String)>, body: Bytes) -> Response {
+    stored(s.db.put_checkpoint(&repo_id, &id, &body).await)
 }
 async fn put_binding(State(s): State<Shared>, Path((repo_id, id)): Path<(String, String)>, body: Bytes) -> Response {
     stored(s.db.put_binding(&repo_id, &id, &body).await)
@@ -247,11 +252,12 @@ async fn api_audits(State(s): State<Shared>, Path((owner, name)): Path<(String, 
         let (audits, total) = s.db.audit_page(&repo.repo_id, q.author.as_deref(), q.gap.as_deref(), page).await?;
         let ids: Vec<String> = audits.iter().map(|a| a.audit_id.clone()).collect();
         let bindings = s.db.bindings_for(&repo.repo_id, &ids).await?;
-        Ok::<_, DbError>((audits, total, bindings))
+        let counts = s.db.checkpoint_counts(&repo.repo_id, &ids).await?;
+        Ok::<_, DbError>((audits, total, bindings, counts))
     }
     .await;
     match result {
-        Ok((audits, total, bindings)) => Json(json!({"repo": repo.slug, "total": total, "page": page, "per_page": db::PAGE_SIZE, "audits": audits.iter().map(|a| api::audit_row(
+        Ok((audits, total, bindings, counts)) => Json(json!({"repo": repo.slug, "total": total, "page": page, "per_page": db::PAGE_SIZE, "audits": audits.iter().map(|a| api::audit_row(
             &RowFields {
                 audit_id: &a.audit_id,
                 created_at: &a.created_at,
@@ -259,6 +265,7 @@ async fn api_audits(State(s): State<Shared>, Path((owner, name)): Path<(String, 
                 author: a.author_login.as_deref(),
                 changes: a.changes,
                 gaps: a.gaps,
+                checkpoints: counts.get(&a.audit_id).copied().unwrap_or(0),
                 gap_codes: &a.gap_codes,
                 parents: &a.parents,
             },

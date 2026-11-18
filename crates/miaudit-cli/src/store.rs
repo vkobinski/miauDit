@@ -2,7 +2,7 @@
 use crate::error::{CliError, Res};
 use miaudit_schema::{
     digest::content_id,
-    model::{EvidenceBody, Manifest, Stored, StoredBinding, TreeEntry},
+    model::{EvidenceBody, Manifest, Stored, StoredBinding, StoredCheckpoint, TreeEntry},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, fs, io::Write, path::{Path, PathBuf}};
@@ -204,6 +204,26 @@ impl Store {
             return Ok(false);
         }
         write_immutable(&path, bytes)
+    }
+    pub fn put_checkpoint(&self, id: &str, bytes: &[u8]) -> Res<bool> {
+        fs::create_dir_all(self.dir.join("checkpoints"))?;
+        let path = self.dir.join("checkpoints").join(format!("{id}.json"));
+        if path.exists() {
+            return Ok(false);
+        }
+        write_immutable(&path, bytes)
+    }
+    pub fn list_checkpoints(&self) -> Res<Vec<StoredCheckpoint>> {
+        let dir = self.dir.join("checkpoints");
+        let Ok(rd) = fs::read_dir(&dir) else { return Ok(vec![]) };
+        let mut out = Vec::new();
+        for e in rd.flatten() {
+            if e.path().extension().is_some_and(|x| x == "json") {
+                out.push(serde_json::from_slice(&fs::read(e.path())?)?);
+            }
+        }
+        out.sort_by(|a: &StoredCheckpoint, b| (a.created.at.as_str(), a.body.first_seq, a.checkpoint_id.as_str()).cmp(&(b.created.at.as_str(), b.body.first_seq, b.checkpoint_id.as_str())));
+        Ok(out)
     }
     pub fn list_bindings(&self) -> Res<Vec<StoredBinding>> {
         let dir = self.dir.join("bindings");
