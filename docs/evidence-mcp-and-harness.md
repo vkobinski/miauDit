@@ -1,16 +1,16 @@
 # Evidence MCP and execution harness
 
-Status: proposed design, with no implementation. Extends the [product model](../README.md). Tool names, resource URIs and Rust module boundaries below are proposed auditAI contracts, not existing client capabilities.
+Status: proposed design, with no implementation. Extends the [product model](../README.md). Tool names, resource URIs and Rust module boundaries below are proposed miauDit contracts, not existing client capabilities.
 
 ## 1. Two cooperating components
 
-The **auditAI MCP server** gives an AI a structured interface to report context, propose decisions, attach evidence, request verification, inspect missing evidence, and prepare a commit dossier.
+The **miauDit MCP server** gives an AI a structured interface to report context, propose decisions, attach evidence, request verification, inspect missing evidence, and prepare a commit dossier.
 
-The **auditAI harness** starts and supervises an agent's execution environment, captures supported actions automatically, and issues receipts for operations it actually observes. It supplies the execution substrate behind applicable MCP tools and independently ingests supported client events.
+The **miauDit harness** starts and supervises an agent's execution environment, captures supported actions automatically, and issues receipts for operations it actually observes. It supplies the execution substrate behind applicable MCP tools and independently ingests supported client events.
 
 Together they capture both meaning and behavior: the agent explains the choice; the harness records the files accessed, commands executed, changes made, and outcomes observed. A model saying “I ran the tests” remains a claim until linked to an execution receipt. A test receipt establishes execution and its reported result, not correctness of the test suite.
 
-The evidence MCP server is distinct from an MCP gateway. The former exposes auditAI tools; the latter observes or mediates access to other MCP servers. Connecting the evidence server alone does not intercept other tools, filesystem access, or conversation history.
+The evidence MCP server is distinct from an MCP gateway. The former exposes miauDit tools; the latter observes or mediates access to other MCP servers. Connecting the evidence server alone does not intercept other tools, filesystem access, or conversation history.
 
 ## 2. Trust and authority
 
@@ -31,11 +31,11 @@ Evidence records have separate dimensions: origin (`agent_statement`, `harness_o
 ```text
 Authenticated developer / approved task
                  |
-          Rust auditAI harness
+          Rust miauDit harness
           |                 |
    agent client adapter     collector / workspace snapshotter
           |
-      AI agent ----- auditAI MCP server ----- evidence ledger
+      AI agent ----- miauDit MCP server ----- evidence ledger
           |                 |
           |           harness operation broker
           |                 |

@@ -1,0 +1,183 @@
+mod commands;
+mod error;
+mod events;
+mod git;
+mod snapshot;
+mod store;
+
+use clap::{Parser, Subcommand};
+use commands::{Ctx, Out};
+use serde_json::{Value, json};
+
+const CONTRACT_VERSION: &str = miaudit_schema::CONTRACT_VERSION;
+
+#[derive(Parser)]
+#[command(name = "miaudit", about = "miauDit local audit core (provenance for AI-assisted changes)")]
+struct Cli {
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    Init,
+    Status,
+    Add { paths: Vec<String> },
+    Diff {
+        #[arg(long)]
+        staged: bool,
+    },
+    Context { #[command(subcommand)] op: AddOp },
+    Decision { #[command(subcommand)] op: AddOp },
+    Evidence { #[command(subcommand)] op: AddOp },
+    Gaps,
+    Commit {
+        #[arg(short = 'm', long)]
+        message: String,
+    },
+    Log,
+    Bind {
+        audit_id: String,
+        #[arg(long = "git-commit")]
+        git_commit: String,
+        #[arg(long)]
+        assert: bool,
+    },
+    Bindings { audit_id: Option<String> },
+    Related { git_commit: String },
+    Events,
+    Capture,
+    StopCheck,
+    Show { id: String },
+    Verify { id: String },
+}
+
+#[derive(Subcommand)]
+enum AddOp {
+    Add {
+        #[arg(long)]
+        file: String,
+    },
+}
+
+fn run(cli: &Cli) -> error::Res<Out> {
+    let cwd = std::env::current_dir()?;
+    if let Cmd::Init = cli.cmd {
+        return commands::init(&cwd);
+    }
+    let ctx = Ctx::open(&cwd)?;
+    match &cli.cmd {
+        Cmd::Init => unreachable!(),
+        Cmd::Status => commands::status(&ctx),
+        Cmd::Add { paths } => commands::add(&ctx, paths),
+        Cmd::Diff { staged } => commands::diff(&ctx, *staged),
+        Cmd::Context { op: AddOp::Add { file } } => commands::context_add(&ctx, file),
+        Cmd::Decision { op: AddOp::Add { file } } => commands::decision_add(&ctx, file),
+        Cmd::Evidence { op: AddOp::Add { file } } => commands::evidence_add(&ctx, file),
+        Cmd::Gaps => commands::gaps(&ctx),
+        Cmd::Commit { message } => commands::commit(&ctx, message),
+        Cmd::Log => commands::log(&ctx),
+        Cmd::Bind { audit_id, git_commit, assert } => commands::bind(&ctx, audit_id, git_commit, *assert),
+        Cmd::Bindings { audit_id } => commands::bindings(&ctx, audit_id.as_deref()),
+        Cmd::Related { git_commit } => commands::related(&ctx, git_commit),
+        Cmd::Events => commands::events_status(&ctx),
+        Cmd::Capture | Cmd::StopCheck => unreachable!("handled before the JSON envelope"),
+        Cmd::Show { id } => commands::show(&ctx, id),
+        Cmd::Verify { id } => commands::verify(&ctx, id),
+    }
+}
+
+fn render(v: &Value, indent: usize, out: &mut String) {
+    let pad = "  ".repeat(indent);
+    match v {
+        Value::Object(m) => {
+            for (k, v) in m {
+                match v {
+                    Value::Object(_) | Value::Array(_) if !v.as_array().is_some_and(|a| a.is_empty()) => {
+                        out.push_str(&format!("{pad}{k}:\n"));
+                        render(v, indent + 1, out);
+                    }
+                    _ => out.push_str(&format!("{pad}{k}: {}\n", scalar(v))),
+                }
+            }
+        }
+        Value::Array(a) => {
+            for item in a {
+                match item {
+                    Value::Object(_) | Value::Array(_) => {
+                        out.push_str(&format!("{pad}-\n"));
+                        render(item, indent + 1, out);
+                    }
+                    _ => out.push_str(&format!("{pad}- {}\n", scalar(item))),
+                }
+            }
+        }
+        _ => out.push_str(&format!("{pad}{}\n", scalar(v))),
+    }
+}
+
+fn scalar(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) if a.is_empty() => "[]".into(),
+        other => other.to_string(),
+    }
+}
+
+fn run_hook(cmd: &Cmd) -> ! {
+    use std::io::Read;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut buf = Vec::new();
+    let read = std::io::stdin().take(events::MAX_HOOK_INPUT + 1).read_to_end(&mut buf);
+    let input: Option<Value> = if read.is_ok() && buf.len() as u64 <= events::MAX_HOOK_INPUT { serde_json::from_slice(&buf).ok() } else { None };
+    let hook_cwd = input.as_ref().and_then(|v| v.get("cwd")).and_then(Value::as_str).map(std::path::PathBuf::from).unwrap_or(cwd);
+    let Ok(ctx) = Ctx::open(&hook_cwd) else {
+        eprintln!("miaudit: no .audit store found from {}; hook ignored", hook_cwd.display());
+        std::process::exit(0);
+    };
+    match cmd {
+        Cmd::Capture => {
+            let res = match &input {
+                Some(v) => events::capture(&ctx.store, &ctx.cwd, v),
+                None => events::capture_unparsed(&ctx.store, "hook input was not valid JSON or exceeded the size limit", buf.len() as u64),
+            };
+            if let Err(e) = res {
+                eprintln!("miaudit: capture failed: {}", e.rule);
+            }
+            std::process::exit(0)
+        }
+        _ => {
+            if input.as_ref().and_then(|v| v.get("stop_hook_active")).and_then(Value::as_bool) == Some(true) {
+                std::process::exit(0);
+            }
+            match commands::stop_check(&ctx) {
+                Some(msg) => {
+                    eprintln!("{msg}");
+                    std::process::exit(2)
+                }
+                None => std::process::exit(0),
+            }
+        }
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    if matches!(cli.cmd, Cmd::Capture | Cmd::StopCheck) {
+        run_hook(&cli.cmd);
+    }
+    let (envelope, exit) = match run(&cli) {
+        Ok(Out { value, exit }) => (json!({"contract_version": CONTRACT_VERSION, "ok": exit == 0, "result": value}), exit),
+        Err(e) => (json!({"contract_version": CONTRACT_VERSION, "ok": false, "error": e.to_json()}), e.exit),
+    };
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+    } else {
+        let mut s = String::new();
+        render(&envelope, 0, &mut s);
+        print!("{s}");
+    }
+    std::process::exit(exit);
+}

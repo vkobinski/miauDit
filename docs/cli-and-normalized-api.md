@@ -4,7 +4,7 @@ Status: design only. No CLI, API or UI is implemented. Extends the [product mode
 
 ## 1. Shared interface
 
-Expose one versioned, typed domain interface through an HTTP JSON API. The Git-like `audit` CLI and auditAI MCP server are adapters to that interface. They must not have different validation, authorization, evidence or approval rules.
+Expose one versioned, typed domain interface through an HTTP JSON API. The Git-like `audit` CLI and miauDit MCP server are adapters to that interface. They must not have different validation, authorization, evidence or approval rules.
 
 The API accepts structured records instead of treating a chat transcript as an authoritative audit. Free text remains useful for context descriptions and concise rationales, but identity, source references, file state, check outcomes and approvals have explicit types and verification requirements.
 
