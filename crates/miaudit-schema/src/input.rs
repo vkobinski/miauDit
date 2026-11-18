@@ -34,6 +34,30 @@ pub enum Relation {
     Context,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Frontend,
+    Api,
+    Other,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Before,
+    After,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum Environment {
+    Local,
+    Staging,
+    Production,
+    Ci,
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceLink {
@@ -52,6 +76,8 @@ pub struct ContextInput {
     pub constraints: Vec<String>,
     #[serde(default)]
     pub source_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_kind: Option<ChangeKind>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -80,6 +106,10 @@ pub struct EvidenceInput {
     pub file: Option<String>,
     #[serde(default)]
     pub decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<Phase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Environment>,
 }
 
 pub trait Validate {
@@ -195,5 +225,23 @@ mod tests {
         assert_eq!(err.code, "UNSUPPORTED_SCHEMA");
         let long = DECISION.replace("\"q\"", &format!("\"{}\"", "x".repeat(513)));
         assert_eq!(parse_input::<DecisionInput>(long.as_bytes()).unwrap_err().field, "/question");
+    }
+
+    #[test]
+    fn new_optional_fields_do_not_change_old_serialization() {
+        let ctx: ContextInput = parse_input(br#"{"schema_version":"1","description":"d"}"#).unwrap();
+        assert!(!serde_json::to_string(&ctx).unwrap().contains("change_kind"));
+        let ev: EvidenceInput = parse_input(br#"{"schema_version":"1","classification":"internal","description":"d","content":"x"}"#).unwrap();
+        let text = serde_json::to_string(&ev).unwrap();
+        assert!(!text.contains("phase") && !text.contains("environment"));
+    }
+
+    #[test]
+    fn rejects_unknown_phase_environment_and_change_kind() {
+        let base = r#"{"schema_version":"1","classification":"internal","description":"d","content":"x","#;
+        assert!(parse_input::<EvidenceInput>(format!(r#"{base}"phase":"during"}}"#).as_bytes()).is_err());
+        assert!(parse_input::<EvidenceInput>(format!(r#"{base}"environment":"laptop"}}"#).as_bytes()).is_err());
+        assert!(parse_input::<EvidenceInput>(format!(r#"{base}"phase":"before","environment":"staging"}}"#).as_bytes()).is_ok());
+        assert!(parse_input::<ContextInput>(br#"{"schema_version":"1","description":"d","change_kind":"mobile"}"#).is_err());
     }
 }

@@ -37,6 +37,7 @@ pub struct EvidenceView {
     pub object: Option<Stored<EvidenceBody>>,
     pub preview: Option<String>,
     pub artifact_state: &'static str,
+    pub image: bool,
 }
 
 pub struct View {
@@ -54,9 +55,9 @@ fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Option<T> {
 
 impl Repo {
     pub fn open(root: &Path) -> Result<Repo, String> {
-        let dir = root.join(".audit");
+        let dir = root.join(".miaudit");
         if !dir.join("config.json").is_file() {
-            return Err(format!("{} is not an initialized audit repository (no .audit/config.json)", root.display()));
+            return Err(format!("{} is not an initialized audit repository (no .miaudit/config.json)", root.display()));
         }
         let bindings: Vec<StoredBinding> = fs::read_dir(dir.join("bindings")).into_iter().flatten().flatten()
             .filter_map(|e| read_json(&e.path())).collect();
@@ -90,12 +91,31 @@ impl Repo {
         read_json(&self.dir.join("objects").join(sub).join(format!("{id}.json")))
     }
 
+    pub fn evidence_image(&self, audit_id: &str, evidence_id: &str) -> Option<(&'static str, Vec<u8>)> {
+        let s = self.summaries.iter().find(|s| s.id == audit_id)?;
+        if !s.manifest.evidence_ids.iter().any(|e| e == evidence_id) {
+            return None;
+        }
+        let o: Stored<EvidenceBody> = self.object("evidence", evidence_id)?;
+        let digest = o.body.artifact.digest;
+        let hex = digest.strip_prefix("sha256:")?;
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let bytes = fs::read(self.dir.join("blobs").join(hex)).ok()?;
+        if bytes.len() > 10 * 1024 * 1024 || miaudit_schema::digest::content_id(&bytes) != digest {
+            return None;
+        }
+        let mime = miaudit_schema::media::image_mime(&bytes)?;
+        Some((mime, bytes))
+    }
+
     pub fn load(&self, id: &str) -> Option<View> {
         let s = self.summaries.iter().find(|s| s.id == id)?;
         let m = &s.manifest;
         let evidence = m.evidence_ids.iter().map(|eid| {
             let object: Option<Stored<EvidenceBody>> = self.object("evidence", eid);
-            let (mut preview, mut state) = (None, "object unavailable");
+            let (mut preview, mut state, mut image) = (None, "object unavailable", false);
             if let Some(o) = &object {
                 let hex = o.body.artifact.digest.strip_prefix("sha256:").unwrap_or("");
                 state = "artifact unavailable";
@@ -104,14 +124,17 @@ impl Repo {
                     && let Ok(bytes) = fs::read(self.dir.join("blobs").join(hex))
                 {
                     state = "present (digest checked by verify)";
-                    if bytes.len() <= 8192 {
-                        preview = String::from_utf8(bytes).ok();
-                    } else {
-                        state = "present, too large to preview";
+                    image = miaudit_schema::media::image_mime(&bytes).is_some();
+                    if !image {
+                        if bytes.len() <= 8192 {
+                            preview = String::from_utf8(bytes).ok();
+                        } else {
+                            state = "present, too large to preview";
+                        }
                     }
                 }
             }
-            EvidenceView { id: eid.clone(), object, preview, artifact_state: state }
+            EvidenceView { id: eid.clone(), object, preview, artifact_state: state, image }
         }).collect();
         Some(View {
             id: id.into(),

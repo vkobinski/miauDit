@@ -1,18 +1,56 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.cargo/bin/miaudit session-start"
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "$HOME/.cargo/bin/miaudit capture" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.cargo/bin/miaudit capture"
+          }
+        ]
+      }
     ],
     "PostToolUse": [
-      { "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
-        "hooks": [ { "type": "command", "command": "$HOME/.cargo/bin/miaudit capture" } ] }
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.cargo/bin/miaudit capture"
+          }
+        ]
+      }
     ],
     "PostToolUseFailure": [
-      { "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
-        "hooks": [ { "type": "command", "command": "$HOME/.cargo/bin/miaudit capture" } ] }
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.cargo/bin/miaudit capture"
+          }
+        ]
+      }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "$HOME/.cargo/bin/miaudit stop-check" } ] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.cargo/bin/miaudit stop-check"
+          }
+        ]
+      }
     ]
   }
 }

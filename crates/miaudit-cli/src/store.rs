@@ -63,23 +63,27 @@ fn write_immutable(path: &Path, bytes: &[u8]) -> Res<bool> {
 
 impl Store {
     pub fn init(root: &Path, config: &Config) -> Res<Store> {
-        let dir = root.join(".audit");
+        let dir = root.join(".miaudit");
         for d in ["", "objects/contexts", "objects/decisions", "objects/evidence", "blobs", "commits"] {
             fs::create_dir_all(dir.join(d))?;
         }
         write_atomic(&dir.join("config.json"), &serde_json::to_vec_pretty(config)?)?;
+        write_atomic(&dir.join(".gitignore"), b"*\n")?;
         Ok(Store { root: root.to_path_buf(), dir })
     }
 
     pub fn discover(cwd: &Path) -> Res<Store> {
         let mut cur = Some(cwd);
         while let Some(d) = cur {
+            if d.join(".miaudit/config.json").is_file() {
+                return Ok(Store { root: d.to_path_buf(), dir: d.join(".miaudit") });
+            }
             if d.join(".audit/config.json").is_file() {
-                return Ok(Store { root: d.to_path_buf(), dir: d.join(".audit") });
+                return Err(CliError::validation("LEGACY_STORE", format!("{} holds a store in the old .audit/ directory; rename it with `mv .audit .miaudit`", d.display())));
             }
             cur = d.parent();
         }
-        Err(CliError::validation("NOT_INITIALIZED", "no .audit directory found; run `miaudit init`"))
+        Err(CliError::validation("NOT_INITIALIZED", "no .miaudit directory found; run `miaudit init`"))
     }
 
     fn read_json<T: DeserializeOwned>(&self, rel: &str) -> Res<Option<T>> {

@@ -201,8 +201,11 @@ fn file_data(store: &Store, cwd: &Path, p: &str, operation: &str) -> Value {
             let digest = fs::symlink_metadata(&abs).ok().filter(|m| m.is_file()).and_then(|_| snapshot::capture(&abs, &rel).ok()).map(|(e, _)| e.digest);
             json!({"path": rel, "operation": operation, "digest_after": digest})
         }
+        Err(_) if p.ends_with(".miaudit/PROJECT.md") => {
+            json!({"project_profile_edit": true, "path_as_given": p, "operation": operation})
+        }
         Err(e) if e.rule.contains("excluded from capture") => {
-            json!({"touches_audit_store": p.contains(".audit"), "touches_git_dir": p.contains(".git"), "path_as_given": p})
+            json!({"touches_audit_store": p.contains(".miaudit"), "touches_git_dir": p.contains(".git"), "path_as_given": p})
         }
         Err(_) => json!({"outside_repo_or_unsupported": true, "path_as_given": p}),
     }

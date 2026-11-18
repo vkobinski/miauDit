@@ -4,7 +4,7 @@ use std::{fs, path::Path, process::Command};
 use tempfile::TempDir;
 
 fn audit(dir: &Path, args: &[&str]) -> (i32, Value) {
-    let out = Command::new(env!("CARGO_BIN_EXE_miaudit")).current_dir(dir).arg("--json").args(args).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_miaudit")).env("MIAUDIT_GITHUB_USER", "test-user").current_dir(dir).arg("--json").args(args).output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("not json: {}", String::from_utf8_lossy(&out.stdout)));
     (out.status.code().unwrap(), v)
 }
@@ -51,7 +51,7 @@ fn bind_full_correspondence_with_github_link() {
     assert_eq!((r["paths_matched"].as_u64(), r["paths_total"].as_u64()), (Some(2), Some(2)));
     assert_eq!(r["git_commit"], sha.as_str());
     assert_eq!(r["commit_web_url"], format!("https://github.com/acme/repo/commit/{sha}").as_str());
-    let stored = fs::read_dir(d.path().join(".audit/bindings")).unwrap().map(|e| fs::read_to_string(e.unwrap().path()).unwrap()).collect::<String>();
+    let stored = fs::read_dir(d.path().join(".miaudit/bindings")).unwrap().map(|e| fs::read_to_string(e.unwrap().path()).unwrap()).collect::<String>();
     assert!(!stored.contains("s3cret") && !stored.contains("user:"), "{stored}");
 }
 
@@ -161,14 +161,67 @@ fn verify_detects_a_tampered_binding_and_the_manifest_is_not_touched() {
     let id = audit_commit(d.path(), &[("a.txt", "one")]);
     git(d.path(), &["add", "a.txt"]);
     git(d.path(), &["commit", "-q", "-m", "c1"]);
-    let before = fs::read(d.path().join(format!(".audit/commits/{id}.json"))).unwrap();
+    let before = fs::read(d.path().join(format!(".miaudit/commits/{id}.json"))).unwrap();
     audit(d.path(), &["bind", &id, "--git-commit", "HEAD"]);
-    assert_eq!(fs::read(d.path().join(format!(".audit/commits/{id}.json"))).unwrap(), before, "binding must not alter the manifest");
+    assert_eq!(fs::read(d.path().join(format!(".miaudit/commits/{id}.json"))).unwrap(), before, "binding must not alter the manifest");
     assert_eq!(audit(d.path(), &["verify", &id]).0, 0);
 
-    let f = fs::read_dir(d.path().join(".audit/bindings")).unwrap().next().unwrap().unwrap().path();
+    let f = fs::read_dir(d.path().join(".miaudit/bindings")).unwrap().next().unwrap().unwrap().path();
     let text = fs::read_to_string(&f).unwrap().replace("\"full\"", "\"asserted\"");
     fs::write(&f, text).unwrap();
     let (code, v) = audit(d.path(), &["verify", &id]);
     assert_eq!((code, v["result"]["verified"]["integrity"].as_str()), (2, Some("fail")));
+}
+
+#[test]
+fn bind_pending_links_only_full_matches_and_leaves_linked_ones_alone() {
+    let d = repo();
+    let p = d.path();
+    let full = audit_commit(p, &[("a.txt", "one")]);
+    let partial = audit_commit(p, &[("b.txt", "two"), ("c.txt", "three")]);
+    git(p, &["add", "a.txt", "b.txt"]);
+    git(p, &["commit", "-q", "-m", "c1"]);
+
+    let (code, v) = audit(p, &["bind-pending", "--git-commit", "HEAD"]);
+    assert_eq!(code, 0, "{v}");
+    let linked: Vec<&str> = v["result"]["linked"].as_array().unwrap().iter().map(|l| l["audit_id"].as_str().unwrap()).collect();
+    assert_eq!(linked, vec![full.as_str()]);
+    let skipped = v["result"]["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0]["audit_id"], partial.as_str());
+    assert!(skipped[0]["reason"].as_str().unwrap().contains("partial"));
+    assert_eq!(audit(p, &["bindings", &partial]).1["result"]["bindings"].as_array().unwrap().len(), 0, "a partial match must not be recorded");
+
+    let again = audit(p, &["bind-pending"]).1;
+    assert_eq!(again["result"]["linked"].as_array().unwrap().len(), 0);
+    assert_eq!(audit(p, &["bindings", &full]).1["result"]["bindings"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn post_commit_hook_installs_safely_and_links_after_git_commit() {
+    let d = repo();
+    let p = d.path();
+    let (code, v) = audit(p, &["git-hook", "install"]);
+    assert_eq!(code, 0, "{v}");
+    let hook = p.join(".git/hooks/post-commit");
+    assert!(std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&hook).unwrap().permissions()) & 0o111 != 0);
+    assert_eq!(audit(p, &["git-hook", "install"]).1["result"]["changed"], false);
+
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".cargo/bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_miaudit"), home.path().join(".cargo/bin/miaudit")).unwrap();
+    let id = audit_commit(p, &[("a.txt", "one")]);
+    git(p, &["add", "a.txt"]);
+    let out = Command::new("git").env("HOME", home.path()).env("MIAUDIT_GITHUB_USER", "test-user").current_dir(p)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "c1"]).output().unwrap();
+    assert!(out.status.success());
+    let b = audit(p, &["bindings", &id]).1;
+    assert_eq!(b["result"]["bindings"].as_array().unwrap().len(), 1);
+    assert_eq!(b["result"]["bindings"][0]["body"]["correspondence"], "full");
+
+    let d2 = repo();
+    fs::write(d2.path().join(".git/hooks/post-commit"), "#!/bin/sh\necho mine\n").unwrap();
+    let (code, v) = audit(d2.path(), &["git-hook", "install"]);
+    assert_eq!(code, 3, "{v}");
+    assert_eq!(fs::read_to_string(d2.path().join(".git/hooks/post-commit")).unwrap(), "#!/bin/sh\necho mine\n");
 }

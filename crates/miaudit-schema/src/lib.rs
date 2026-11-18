@@ -2,6 +2,7 @@
 pub mod canonical;
 pub mod digest;
 pub mod input;
+pub mod media;
 pub mod model;
 
 pub const SCHEMA_VERSION: &str = "1";

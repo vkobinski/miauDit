@@ -7,7 +7,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-pub const EXCLUDED_DIRS: [&str; 2] = [".git", ".audit"];
+pub const EXCLUDED_DIRS: [&str; 2] = [".git", ".miaudit"];
 pub const MODE_FILE: u32 = 0o100644;
 pub const MODE_EXEC: u32 = 0o100755;
 pub const MODE_SYMLINK: u32 = 0o120000;
