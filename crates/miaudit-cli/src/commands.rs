@@ -59,19 +59,43 @@ impl Ctx {
     }
 }
 
-pub fn init(cwd: &Path) -> Res<Out> {
+fn hooks_report(plan: &Option<crate::claude_hooks::Plan>) -> Value {
+    match plan {
+        None => json!({"installed": false, "reason": "skipped with --no-hooks"}),
+        Some(p) => json!({
+            "installed": true,
+            "agent": "claude-code",
+            "settings_path": p.path,
+            "created_file": p.created_file && !p.added.is_empty(),
+            "added": p.added,
+            "already_present": p.already_present,
+            "warning": crate::claude_hooks::binary_warning(),
+            "note": "Claude Code reads hook settings when a session starts; in a session that is already open, review them in /hooks or restart it",
+        }),
+    }
+}
+
+pub fn init(cwd: &Path, hooks: bool, local: bool) -> Res<Out> {
     let cwd = cwd.canonicalize()?;
     if let Ok(s) = Store::discover(&cwd) {
         let c = s.config()?;
-        return ok(json!({"already_initialized": true, "repo_id": c.repo_id, "root": s.root}));
+        let plan = if hooks { Some(crate::claude_hooks::plan(&s.root, local)?) } else { None };
+        if let Some(p) = &plan {
+            p.apply()?;
+        }
+        return ok(json!({"already_initialized": true, "repo_id": c.repo_id, "root": s.root, "hooks": hooks_report(&plan)}));
     }
+    let plan = if hooks { Some(crate::claude_hooks::plan(&cwd, local)?) } else { None };
     let probe = cwd.join(".audit-case-probe-x");
     let case_sensitive = fs::write(&probe, b"").ok().map(|_| !cwd.join(".AUDIT-CASE-PROBE-X").exists());
     let _ = fs::remove_file(&probe);
     let config = Config { schema_version: SCHEMA_VERSION.into(), repo_id: format!("repo_{}", uuid::Uuid::new_v4().simple()), created_at: now(), case_sensitive };
     let s = Store::init(&cwd, &config)?;
     project::init(&s)?;
-    ok(json!({"already_initialized": false, "repo_id": config.repo_id, "root": s.root, "case_sensitive": case_sensitive}))
+    if let Some(p) = &plan {
+        p.apply()?;
+    }
+    ok(json!({"already_initialized": false, "repo_id": config.repo_id, "root": s.root, "case_sensitive": case_sensitive, "hooks": hooks_report(&plan)}))
 }
 
 fn now() -> String {

@@ -1,3 +1,4 @@
+mod claude_hooks;
 mod commands;
 mod error;
 mod events;
@@ -24,7 +25,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    Init,
+    Init {
+        #[arg(long)]
+        no_hooks: bool,
+        #[arg(long)]
+        local: bool,
+    },
     Status,
     Add { paths: Vec<String> },
     Diff {
@@ -90,12 +96,12 @@ enum AddOp {
 
 fn run(cli: &Cli) -> error::Res<Out> {
     let cwd = std::env::current_dir()?;
-    if let Cmd::Init = cli.cmd {
-        return commands::init(&cwd);
+    if let Cmd::Init { no_hooks, local } = &cli.cmd {
+        return commands::init(&cwd, !*no_hooks, *local);
     }
     let ctx = Ctx::open(&cwd)?;
     match &cli.cmd {
-        Cmd::Init => unreachable!(),
+        Cmd::Init { .. } => unreachable!(),
         Cmd::Status => commands::status(&ctx),
         Cmd::Add { paths } => commands::add(&ctx, paths),
         Cmd::Diff { staged } => commands::diff(&ctx, *staged),
