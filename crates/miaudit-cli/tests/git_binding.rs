@@ -225,3 +225,92 @@ fn post_commit_hook_installs_safely_and_links_after_git_commit() {
     assert_eq!(code, 3, "{v}");
     assert_eq!(fs::read_to_string(d2.path().join(".git/hooks/post-commit")).unwrap(), "#!/bin/sh\necho mine\n");
 }
+
+fn fake_gh(body: &str) -> TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("gh");
+    fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    d
+}
+
+fn audit_with_gh(dir: &Path, gh: &TempDir, args: &[&str]) -> (i32, Value) {
+    let path = format!("{}:/usr/bin:/bin", gh.path().display());
+    let out = Command::new(env!("CARGO_BIN_EXE_miaudit")).env("MIAUDIT_GITHUB_USER", "test-user").env("PATH", path).current_dir(dir).arg("--json").args(args).output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("not json: {}", String::from_utf8_lossy(&out.stdout)));
+    (out.status.code().unwrap(), v)
+}
+
+fn pr_json(number: u64, url: &str, head: &str, state: &str) -> String {
+    format!(r#"echo '{{"number":{number},"url":"{url}","headRefOid":"{head}","state":"{state}"}}'"#)
+}
+
+#[test]
+fn bind_to_a_pull_request_checks_its_head_commit_and_records_the_pr() {
+    let d = repo();
+    git(d.path(), &["remote", "add", "origin", "git@github.com:acme/repo.git"]);
+    let id = audit_commit(d.path(), &[("a.txt", "one"), ("b.txt", "two")]);
+    git(d.path(), &["add", "a.txt", "b.txt"]);
+    git(d.path(), &["commit", "-q", "-m", "c1"]);
+    let sha = git(d.path(), &["rev-parse", "HEAD"]);
+    let gh = fake_gh(&pr_json(7, "https://github.com/acme/repo/pull/7", &sha, "OPEN"));
+
+    let (code, v) = audit_with_gh(d.path(), &gh, &["bind", &id, "--pr", "7"]);
+    assert_eq!(code, 0, "{v}");
+    let r = &v["result"];
+    assert_eq!(r["correspondence"], "full");
+    assert_eq!(r["git_commit"], sha.as_str());
+    assert_eq!(r["pull_request"]["number"], 7);
+    assert_eq!(r["pull_request"]["web_url"], "https://github.com/acme/repo/pull/7");
+    assert_eq!(r["pull_request"]["head_commit"], sha.as_str());
+    assert_eq!(r["pull_request"]["state"], "OPEN");
+
+    let listed = audit(d.path(), &["bindings", &id]).1;
+    assert_eq!(listed["result"]["bindings"][0]["body"]["pull_request"]["number"], 7);
+    assert_eq!(audit(d.path(), &["related", &sha]).1["result"]["audits"][0]["audit_id"], id.as_str(), "a PR binding is found through its head commit");
+
+    let (_, again) = audit_with_gh(d.path(), &gh, &["bind", &id, "--pr", "https://github.com/acme/repo/pull/7"]);
+    assert_eq!(again["result"]["duplicate"], true, "the same PR by number or URL is the same binding");
+
+    let (_, plain) = audit(d.path(), &["bind", &id, "--git-commit", "HEAD"]);
+    assert_ne!(plain["result"]["binding_id"], r["binding_id"], "a plain commit binding is a different attestation");
+    assert!(plain["result"]["pull_request"].is_null());
+    assert_eq!(audit(d.path(), &["bindings", &id]).1["result"]["bindings"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn pr_binding_failures_are_explicit() {
+    let d = repo();
+    let id = audit_commit(d.path(), &[("a.txt", "one")]);
+    git(d.path(), &["add", "a.txt"]);
+    git(d.path(), &["commit", "-q", "-m", "c1"]);
+    let absent = "f".repeat(40);
+
+    let gh = fake_gh(&pr_json(9, "https://github.com/acme/repo/pull/9", &absent, "OPEN"));
+    let (code, v) = audit_with_gh(d.path(), &gh, &["bind", &id, "--pr", "9"]);
+    assert_eq!((code, v["error"]["code"].as_str()), (2, Some("PR_HEAD_NOT_LOCAL")));
+    assert!(v["error"]["rule"].as_str().unwrap().contains("git fetch origin pull/9/head"));
+
+    let gh = fake_gh("exit 1");
+    let (code, v) = audit_with_gh(d.path(), &gh, &["bind", &id, "--pr", "9"]);
+    assert_eq!((code, v["error"]["code"].as_str()), (2, Some("PR_UNRESOLVABLE")));
+
+    let gh = fake_gh(&pr_json(9, "https://evil.example/acme/repo/pull/9", &absent, "OPEN"));
+    assert_eq!(audit_with_gh(d.path(), &gh, &["bind", &id, "--pr", "9"]).1["error"]["code"], "PR_UNRESOLVABLE", "a non-GitHub URL from gh is refused");
+
+    let gh = fake_gh("echo not json");
+    assert_eq!(audit_with_gh(d.path(), &gh, &["bind", &id, "--pr", "9"]).1["error"]["code"], "PR_UNRESOLVABLE");
+
+    for bad in ["7; echo hi", "https://evil.com/a/b/pull/7", "abc"] {
+        let (code, v) = audit_with_gh(d.path(), &gh, &["bind", &id, "--pr", bad]);
+        assert_eq!((code, v["error"]["code"].as_str()), (2, Some("BAD_PR")), "{bad}");
+    }
+
+    let out = Command::new(env!("CARGO_BIN_EXE_miaudit")).current_dir(d.path()).args(["bind", &id, "--pr", "--web"]).output().unwrap();
+    assert_ne!(out.status.code(), Some(0), "an option-looking value must not reach gh");
+    let out = Command::new(env!("CARGO_BIN_EXE_miaudit")).current_dir(d.path()).args(["bind", &id]).output().unwrap();
+    assert_ne!(out.status.code(), Some(0), "one of --git-commit or --pr is required");
+    let out = Command::new(env!("CARGO_BIN_EXE_miaudit")).current_dir(d.path()).args(["bind", &id, "--git-commit", "HEAD", "--pr", "1"]).output().unwrap();
+    assert_ne!(out.status.code(), Some(0), "--git-commit and --pr are mutually exclusive");
+}

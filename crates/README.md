@@ -10,6 +10,7 @@ Exit codes: `0` ok, `1` internal, `2` validation/integrity failure, `3` conflict
 
 ## Linking audit commits to Git/GitHub commits
 `miaudit bind <audit-id> --git-commit <rev>` compares the audit commit's changes with the Git commit's tree (same content and mode; deletions must be absent) and stores a **separate, immutable attestation** (`.miaudit/bindings/`), so the audit ID never changes. Result: `full`, `partial`, or `asserted` (only with `--assert`; a plain mismatch is rejected with `BINDING_MISMATCH`). Several audits may bind to one Git commit and vice versa.
+`miaudit bind <audit-id> --pr <number|url>` links an audit to a pull request: `gh pr view` supplies the head commit, the same comparison runs against it (the head must be in the local repository), and the binding also records the PR number, URL, head commit and state. A PR binding is found through its head commit by `related`. `--git-commit` and `--pr` are mutually exclusive.
 `miaudit related <git-rev>` answers "which audits explain this commit". The GitHub URL is derived from `origin` (credentials are never stored) and does **not** prove the commit was pushed.
 
 ## Tests

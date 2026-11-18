@@ -91,7 +91,8 @@ fn git_cell(b: &miaudit_schema::model::StoredBinding) -> String {
         Some(u) => github_link(u, &sha),
         None => esc(&sha),
     };
-    format!("<code>{link}</code> {}", corr(b.body.correspondence))
+    let pr = b.body.pull_request.as_ref().map(|p| format!(" {}", github_link(&p.web_url, &format!("PR #{}", p.number)))).unwrap_or_default();
+    format!("<code>{link}</code>{pr} {}", corr(b.body.correspondence))
 }
 
 pub fn index(repo: &Repo, port: u16) -> String {
@@ -179,10 +180,12 @@ pub fn detail(v: &View, ver: &Verification) -> String {
                 format!(r#"<tr><td class="mono">{}</td><td>{}</td><td><span class="badge {cls}">{label}</span></td></tr>"#, esc(&p.path), op(p.operation))
             }).collect();
             let repo = b.body.git.repository_web_url.as_deref().map(|u| github_link(u, u)).unwrap_or_else(|| r#"<span class="muted">no GitHub remote</span>"#.into());
-            format!(r#"<div class="item"><div>{} {}</div><div class="kv" style="margin-top:8px">{}{}{}</div>
+            let pr_row = b.body.pull_request.as_ref().map(|p| kv("Pull request", &format!(r#"{} <span class="muted">head {}, {}</span>"#, github_link(&p.web_url, &p.web_url), esc(&p.head_commit.chars().take(10).collect::<String>()), esc(&p.state)))).unwrap_or_default();
+            format!(r#"<div class="item"><div>{} {}</div><div class="kv" style="margin-top:8px">{}{}{}{}</div>
 <table style="margin-top:8px"><thead><tr><th>Path</th><th>Change</th><th>In git commit</th></tr></thead><tbody>{rows}</tbody></table></div>"#,
                 git_cell(b), prov(b.body.provenance),
                 kv("Git commit", &format!(r#"<span class="mono">{}</span>"#, esc(&b.body.git.commit))),
+                pr_row,
                 kv("Repository", &repo),
                 kv("Binding", &format!(r#"<span class="mono">{}</span> · {}"#, esc(&b.binding_id), esc(&b.body.verification))))
         }).collect()
