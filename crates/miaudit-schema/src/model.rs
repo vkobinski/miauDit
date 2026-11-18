@@ -133,6 +133,10 @@ pub struct EvidenceBody {
     pub description: String,
     pub artifact: ArtifactRef,
     pub decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<crate::input::Phase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::input::Environment>,
 }
 
 pub type StoredEvidence = Stored<EvidenceBody>;
@@ -164,6 +168,8 @@ pub struct Snapshot {
 pub struct Capability {
     pub capability: String,
     pub provenance: Provenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -190,6 +196,16 @@ pub struct Producer {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
+pub struct Author {
+    pub github_login: Option<String>,
+    pub github_id: Option<u64>,
+    pub source: String,
+    pub provenance: Provenance,
+    pub verification: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema_version: String,
     pub canonicalization: String,
@@ -199,6 +215,8 @@ pub struct Manifest {
     pub description: String,
     pub created: Created,
     pub producer: Producer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<Author>,
     pub snapshot: Snapshot,
     pub context_ids: Vec<String>,
     pub decision_ids: Vec<String>,
@@ -301,6 +319,7 @@ mod tests {
             description: "vector".into(),
             created: Created { at: "2026-01-01T00:00:00Z".into(), clock_authority: "local_device_unverified".into() },
             producer: Producer { tool: "audit-cli".into(), version: "0.1.0".into() },
+            author: None,
             snapshot: Snapshot {
                 id: snapshot_id(&td),
                 tree_digest: td,
@@ -379,5 +398,21 @@ mod tests {
         a.insert("mod".into(), entry("mod", 0o100644, "d4"));
         let ops: Vec<_> = diff_trees(&b, &a).into_iter().map(|c| (c.path, c.operation)).collect();
         assert_eq!(ops, vec![("mod".into(), Operation::Modify), ("new".into(), Operation::Add), ("old".into(), Operation::Delete)]);
+    }
+
+    #[test]
+    fn author_is_part_of_the_id_only_when_present() {
+        let base = manifest();
+        assert_eq!(base.audit_id().unwrap(), "audit_7491ebfee4a974198f4b527b1023bee57c4d950a67dd860a9808352c50a6a590");
+        let mut a = manifest();
+        a.author = Some(Author { github_login: Some("octo".into()), github_id: Some(1), source: "gh_api_user".into(), provenance: Provenance::Derived, verification: "x".into() });
+        let mut b = a.clone();
+        b.author.as_mut().unwrap().github_login = Some("other".into());
+        assert_ne!(a.audit_id().unwrap(), base.audit_id().unwrap());
+        assert_ne!(a.audit_id().unwrap(), b.audit_id().unwrap());
+        let round: Manifest = serde_json::from_slice(&serde_json::to_vec(&a).unwrap()).unwrap();
+        assert_eq!(round, a);
+        let old: Manifest = serde_json::from_slice(&serde_json::to_vec(&base).unwrap()).unwrap();
+        assert_eq!(old.author, None);
     }
 }

@@ -48,6 +48,7 @@ code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.
 .b-ok{background:var(--okbg);color:var(--ok)}.b-warn{background:var(--warnbg);color:var(--warn)}.b-bad{background:var(--badbg);color:var(--bad)}.b-neu{background:var(--neubg);color:var(--neu)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
 .stat{border:1px solid var(--line);border-radius:10px;padding:10px 12px}.stat .k{font-size:12px;color:var(--mut)}.stat .v{margin-top:4px}
+.shot{max-width:100%;border:1px solid var(--line, #ccd);border-radius:6px;margin-top:8px}
 .kv{display:grid;grid-template-columns:150px 1fr;gap:6px 14px;font-size:14px}.kv .k{color:var(--mut)}
 .item{border-top:1px solid var(--line);padding:12px 0}.item:first-of-type{border-top:0;padding-top:0}
 .muted{color:var(--mut)}pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:12.5px;margin:6px 0 0}
@@ -98,21 +99,32 @@ pub fn index(repo: &Repo, port: u16) -> String {
     for s in &repo.summaries {
         let git = if s.bindings.is_empty() { r#"<span class="muted">not linked</span>"#.to_string() } else { s.bindings.iter().map(git_cell).collect::<Vec<_>>().join("<br>") };
         rows.push_str(&format!(
-            r#"<tr><td class="mono">{}</td><td><a href="/audit/{id}">{}</a><div class="mono muted">{}</div></td><td>{}</td><td>{}</td><td>{git}</td></tr>"#,
+            r#"<tr><td class="mono">{}</td><td><a href="/audit/{id}">{}</a><div class="mono muted">{}</div></td><td>{}</td><td>{}</td><td>{}</td><td>{git}</td></tr>"#,
             esc(&s.manifest.created.at), esc(&s.manifest.description), short(&s.id),
+            s.manifest.author.as_ref().and_then(|a| a.github_login.as_deref()).map(|l| format!("@{}", esc(l))).unwrap_or_else(|| r#"<span class="muted">-</span>"#.to_string()),
             s.manifest.snapshot.changes.len(), s.manifest.gaps.len(), id = esc(&s.id),
         ));
     }
     let table = if rows.is_empty() {
         r#"<p class="muted">No audit commits yet. Create one with <code>miaudit commit -m "…"</code>.</p>"#.to_string()
     } else {
-        format!("<table><thead><tr><th>Created</th><th>Audit commit</th><th>Changes</th><th>Gaps</th><th>Git commit</th></tr></thead><tbody>{rows}</tbody></table>")
+        format!("<table><thead><tr><th>Created</th><th>Audit commit</th><th>GitHub user</th><th>Changes</th><th>Gaps</th><th>Git commit</th></tr></thead><tbody>{rows}</tbody></table>")
     };
     let warn = if repo.unreadable > 0 { format!(r#"<div class="banner"><span class="badge b-bad">{} unreadable</span> audit commit file(s) could not be parsed and are not listed. Run <code>miaudit verify</code>.</div>"#, repo.unreadable) } else { String::new() };
     shell("miauDit", &format!(
         r#"<header class="top"><h1>miauDit</h1><span class="muted">audit commits</span></header><p class="sub">{} · read-only view on 127.0.0.1:{port}</p>
 <div class="banner">Everything here is local and unsigned. Context, decisions and evidence are <b>self-reported</b>; nothing is shown as approved unless a human approval exists, and none can be recorded yet.</div>{warn}<div class="card">{table}</div>"#,
         esc(&repo.root.display().to_string())))
+}
+
+fn author_cell(a: Option<&miaudit_schema::model::Author>) -> String {
+    match a {
+        None => r#"<span class="muted">not recorded (older audit commit)</span>"#.to_string(),
+        Some(a) => match &a.github_login {
+            Some(l) => format!(r#"<a href="https://github.com/{l}">@{l}</a> {} <span class="muted">({})</span>"#, prov(a.provenance), esc(&a.verification), l = esc(l)),
+            None => format!(r#"{} <span class="muted">{}</span>"#, prov(a.provenance), esc(&a.verification)),
+        },
+    }
 }
 
 fn kv(k: &str, v: &str) -> String {
@@ -143,10 +155,11 @@ pub fn detail(v: &View, ver: &Verification) -> String {
     let parents = if m.parents.is_empty() { r#"<span class="muted">none (root)</span>"#.to_string() } else {
         m.parents.iter().map(|p| format!(r#"<a class="mono" href="/audit/{}">{}</a>"#, esc(p), esc(p))).collect::<Vec<_>>().join("<br>")
     };
-    let meta = format!(r#"<div class="card"><h2>{}</h2><div class="kv">{}{}{}{}{}</div></div>"#,
+    let meta = format!(r#"<div class="card"><h2>{}</h2><div class="kv">{}{}{}{}{}{}</div></div>"#,
         esc(&m.description),
         kv("Audit ID", &format!(r#"<span class="mono">{}</span> · <a href="/api/audits/{id}">raw manifest</a>"#, esc(&v.id), id = esc(&v.id))),
         kv("Created", &format!("{} <span class=\"muted\">({})</span>", esc(&m.created.at), esc(&m.created.clock_authority))),
+        kv("GitHub user", &author_cell(m.author.as_ref())),
         kv("Parents", &parents),
         kv("Producer", &format!("{} {}", esc(&m.producer.tool), esc(&m.producer.version))),
         kv("Repository", &format!(r#"<span class="mono">{}</span>"#, esc(&m.repo_id))));
@@ -219,19 +232,20 @@ pub fn detail(v: &View, ver: &Verification) -> String {
     }).collect();
 
     let evidence: String = v.evidence.iter().map(|e| match &e.object {
-        Some(o) => format!(r#"<div class="item"><div>{} <span class="badge b-neu">{:?}</span> <span class="mono muted">{}</span></div><p>{}</p><div class="kv">{}{}</div>{}</div>"#,
+        Some(o) => format!(r#"<div class="item"><div>{} <span class="badge b-neu">{:?}</span> <span class="mono muted">{}</span></div><p>{}</p><div class="kv">{}</div><div class="kv">{}</div>{}</div>"#,
             prov(o.provenance), o.body.classification, short(&e.id), esc(&o.body.description),
-            kv("Artifact", &format!(r#"<span class="mono">{}</span> · {} bytes"#, esc(&o.body.artifact.digest), o.body.artifact.size)),
+            kv("Artifact", &format!(r#"<span class="mono">{}</span> · {} bytes"#, esc(&o.body.artifact.digest), o.body.artifact.size))
+                + &kv("Phase / environment", &format!("{} {}", o.body.phase.map(|p| format!(r#"<span class="badge b-neu">{p:?}</span>"#)).unwrap_or_else(|| r#"<span class="muted">not declared</span>"#.into()), o.body.environment.map(|p| format!(r#"<span class="badge b-neu">{p:?}</span>"#)).unwrap_or_default())),
             kv("Availability", &esc(e.artifact_state)),
-            e.preview.as_deref().map(|p| format!("<pre>{}</pre>", esc(p))).unwrap_or_default()),
+            if e.image { format!(r#"<img class="shot" src="/audit/{}/evidence/{}/image" alt="evidence image">"#, esc(&v.id), esc(&e.id)) } else { e.preview.as_deref().map(|p| format!("<pre>{}</pre>", esc(p))).unwrap_or_default() }),
         None => format!(r#"<div class="item"><span class="mono">{}</span> <span class="badge b-bad">object unavailable</span></div>"#, esc(&e.id)),
     }).collect();
 
     let section = |title: &str, body: String, empty: &str| format!(r#"<div class="card"><h2>{title}</h2>{}</div>"#, if body.is_empty() { format!(r#"<p class="muted">{empty}</p>"#) } else { body });
 
-    let coverage: String = m.coverage.iter().map(|c| format!(r#"<tr><td>{}</td><td>{}</td></tr>"#, esc(&c.capability), prov(c.provenance))).collect();
+    let coverage: String = m.coverage.iter().map(|c| format!(r#"<tr><td>{}</td><td>{}</td><td class="muted">{}</td></tr>"#, esc(&c.capability), prov(c.provenance), esc(c.note.as_deref().unwrap_or("")))).collect();
     let gaps: String = m.gaps.iter().map(|g| format!(r#"<tr><td class="mono">{}</td><td>{}</td></tr>"#, esc(&g.code), esc(&g.message))).collect();
-    let capture = format!(r#"<div class="card"><h2>Capture coverage</h2><table><thead><tr><th>Capability</th><th>Provenance</th></tr></thead><tbody>{coverage}</tbody></table></div>
+    let capture = format!(r#"<div class="card"><h2>Capture coverage</h2><table><thead><tr><th>Capability</th><th>Provenance</th><th>Note</th></tr></thead><tbody>{coverage}</tbody></table></div>
 <div class="card"><h2>Gaps ({})</h2><table><thead><tr><th>Code</th><th>Meaning</th></tr></thead><tbody>{gaps}</tbody></table></div>"#, m.gaps.len());
 
     let verification = match ver {

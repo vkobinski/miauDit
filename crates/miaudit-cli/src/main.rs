@@ -2,6 +2,8 @@ mod commands;
 mod error;
 mod events;
 mod git;
+mod github;
+mod project;
 mod snapshot;
 mod store;
 
@@ -46,6 +48,11 @@ enum Cmd {
         assert: bool,
     },
     Bindings { audit_id: Option<String> },
+    BindPending {
+        #[arg(long = "git-commit", default_value = "HEAD")]
+        git_commit: String,
+    },
+    GitHook { #[command(subcommand)] op: GitHookOp },
     Related { git_commit: String },
     Events,
     Capture {
@@ -53,8 +60,21 @@ enum Cmd {
         agent: events::Agent,
     },
     StopCheck,
+    SessionStart,
+    Project { #[command(subcommand)] op: ProjectOp },
     Show { id: String },
     Verify { id: String },
+}
+
+#[derive(Subcommand)]
+enum ProjectOp {
+    Init,
+    Check,
+}
+
+#[derive(Subcommand)]
+enum GitHookOp {
+    Install,
 }
 
 #[derive(Subcommand)]
@@ -83,10 +103,14 @@ fn run(cli: &Cli) -> error::Res<Out> {
         Cmd::Commit { message } => commands::commit(&ctx, message),
         Cmd::Log => commands::log(&ctx),
         Cmd::Bind { audit_id, git_commit, assert } => commands::bind(&ctx, audit_id, git_commit, *assert),
+        Cmd::BindPending { git_commit } => commands::bind_pending(&ctx, git_commit),
+        Cmd::GitHook { op: GitHookOp::Install } => commands::git_hook_install(&ctx),
         Cmd::Bindings { audit_id } => commands::bindings(&ctx, audit_id.as_deref()),
         Cmd::Related { git_commit } => commands::related(&ctx, git_commit),
         Cmd::Events => commands::events_status(&ctx),
-        Cmd::Capture { .. } | Cmd::StopCheck => unreachable!("handled before the JSON envelope"),
+        Cmd::Project { op: ProjectOp::Init } => commands::project_init(&ctx),
+        Cmd::Project { op: ProjectOp::Check } => commands::project_check(&ctx),
+        Cmd::Capture { .. } | Cmd::StopCheck | Cmd::SessionStart => unreachable!("handled before the JSON envelope"),
         Cmd::Show { id } => commands::show(&ctx, id),
         Cmd::Verify { id } => commands::verify(&ctx, id),
     }
@@ -133,11 +157,11 @@ fn run_hook(cmd: &Cmd) -> ! {
     use std::io::Read;
     let cwd = std::env::current_dir().unwrap_or_default();
     let mut buf = Vec::new();
-    let read = std::io::stdin().take(events::MAX_HOOK_INPUT + 1).read_to_end(&mut buf);
+    let read = if std::io::IsTerminal::is_terminal(&std::io::stdin()) { Ok(0) } else { std::io::stdin().take(events::MAX_HOOK_INPUT + 1).read_to_end(&mut buf) };
     let input: Option<Value> = if read.is_ok() && buf.len() as u64 <= events::MAX_HOOK_INPUT { serde_json::from_slice(&buf).ok() } else { None };
     let hook_cwd = input.as_ref().and_then(|v| v.get("cwd")).and_then(Value::as_str).map(std::path::PathBuf::from).unwrap_or(cwd);
     let Ok(ctx) = Ctx::open(&hook_cwd) else {
-        eprintln!("miaudit: no .audit store found from {}; hook ignored", hook_cwd.display());
+        eprintln!("miaudit: no .miaudit store found from {}; hook ignored", hook_cwd.display());
         std::process::exit(0);
     };
     match cmd {
@@ -149,6 +173,10 @@ fn run_hook(cmd: &Cmd) -> ! {
             if let Err(e) = res {
                 eprintln!("miaudit: capture failed: {}", e.rule);
             }
+            std::process::exit(0)
+        }
+        Cmd::SessionStart => {
+            print!("{}", project::session_message(&ctx.store));
             std::process::exit(0)
         }
         _ => {
@@ -168,7 +196,7 @@ fn run_hook(cmd: &Cmd) -> ! {
 
 fn main() {
     let cli = Cli::parse();
-    if matches!(cli.cmd, Cmd::Capture { .. } | Cmd::StopCheck) {
+    if matches!(cli.cmd, Cmd::Capture { .. } | Cmd::StopCheck | Cmd::SessionStart) {
         run_hook(&cli.cmd);
     }
     let (envelope, exit) = match run(&cli) {

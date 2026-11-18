@@ -4,7 +4,7 @@ use std::{fs, os::unix::fs::{PermissionsExt, symlink}, path::Path, process::Comm
 use tempfile::TempDir;
 
 fn audit(dir: &Path, args: &[&str]) -> (i32, Value) {
-    let out = Command::new(env!("CARGO_BIN_EXE_miaudit")).current_dir(dir).arg("--json").args(args).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_miaudit")).env("MIAUDIT_GITHUB_USER", "test-user").current_dir(dir).arg("--json").args(args).output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("not json: {}", String::from_utf8_lossy(&out.stdout)));
     (out.status.code().unwrap(), v)
 }
@@ -95,7 +95,7 @@ fn path_traversal_and_excluded_dirs_are_rejected() {
     let outside = tempfile::tempdir().unwrap();
     write(outside.path(), "secret", "s");
     let escape = format!("../{}/secret", outside.path().file_name().unwrap().to_str().unwrap());
-    for p in ["../x", escape.as_str(), "/etc/passwd", ".audit/config.json", ".git/config"] {
+    for p in ["../x", escape.as_str(), "/etc/passwd", ".miaudit/config.json", ".git/config"] {
         let (code, v) = audit(d.path(), &["add", p]);
         assert_eq!(code, 2, "{p}: {v}");
     }
@@ -185,7 +185,7 @@ fn verify_passes_then_detects_tampering_and_partial_data() {
     assert_eq!(v["result"]["human_approved"], false);
     assert_eq!(v["result"]["policy_passed"], "not_evaluated");
 
-    let blob = fs::read_dir(d.path().join(".audit/blobs")).unwrap().next().unwrap().unwrap().path();
+    let blob = fs::read_dir(d.path().join(".miaudit/blobs")).unwrap().next().unwrap().unwrap().path();
     let saved = fs::read(&blob).unwrap();
     fs::remove_file(&blob).unwrap();
     let (code, v) = audit(d.path(), &["verify", &id]);
@@ -196,7 +196,7 @@ fn verify_passes_then_detects_tampering_and_partial_data() {
     assert_eq!((code, v["result"]["verified"]["integrity"].as_str()), (2, Some("fail")));
     fs::write(&blob, saved).unwrap();
 
-    let path = d.path().join(format!(".audit/commits/{id}.json"));
+    let path = d.path().join(format!(".miaudit/commits/{id}.json"));
     let text = fs::read_to_string(&path).unwrap().replace("\"first\"", "\"forged\"");
     fs::write(&path, text).unwrap();
     let (code, v) = audit(d.path(), &["verify", &id]);
@@ -229,7 +229,7 @@ fn commit_manifest_exposes_gaps_and_unverified_provenance() {
     assert_eq!(m["snapshot"]["verification"], "unverified_client_snapshot");
     let unavailable = m["coverage"].as_array().unwrap().iter().filter(|c| c["provenance"] == "unavailable").count();
     assert!(unavailable >= 5);
-    assert!(m["gaps"].as_array().unwrap().iter().any(|g| g["code"] == "CAPTURE_UNAVAILABLE:signatures"));
+    assert!(m["gaps"].as_array().unwrap().iter().any(|g| g["code"] == "CAPTURE_UNAVAILABLE:local_encryption"));
     let text = m.to_string();
     for forbidden in ["approved_by", "audit_id", "signature\""] {
         assert!(!text.contains(forbidden), "{forbidden}");

@@ -16,30 +16,30 @@ Proposed commands, not executable examples of an existing implementation:
 
 | Command | Meaning |
 | --- | --- |
-| `audit init` | Enroll repository/worktree and create local audit metadata |
-| `audit status` | Show changed files, staged snapshot, pending evidence, gaps and synchronization status |
-| `audit context add --file context.json` | Validate and append structured task context with a human-readable description |
-| `audit add <paths>` | Capture and stage file states and their content hashes |
-| `audit diff` | Compare workspace with staged snapshot, or staged snapshot with the last audit commit |
-| `audit decision add --file decision.json` | Append a typed proposal, alternatives, rationale, risks and evidence references |
-| `audit evidence add --file evidence.json` | Submit attributed evidence under the caller's allowed producer type |
-| `audit check <check-id>` | Request a registered harness check against an immutable staged snapshot |
-| `audit gaps` | Explain missing fields, unsupported capture and policy requirements |
-| `audit commit -m <description>` | Create an immutable audit commit from staged file state and selected evidence |
-| `audit bind <audit-id> --git-commit <sha>` | Request verified linkage to an actual Git revision |
-| `audit log` / `audit show <audit-id>` | Inspect audit history and a specific manifest |
-| `audit verify <audit-id>` | Verify available digests, signatures, references and coverage requirements |
-| `audit push` / `audit fetch` | Synchronize authorized immutable audit objects and server receipts |
-| `audit review request <audit-id>` | Request human disposition over an exact manifest |
-| `audit approve <audit-id> --scope <scope>` | Record an explicit disposition through separate human authentication |
+| `miaudit init` | Enroll repository/worktree and create local audit metadata |
+| `miaudit status` | Show changed files, staged snapshot, pending evidence, gaps and synchronization status |
+| `miaudit context add --file context.json` | Validate and append structured task context with a human-readable description |
+| `miaudit add <paths>` | Capture and stage file states and their content hashes |
+| `miaudit diff` | Compare workspace with staged snapshot, or staged snapshot with the last audit commit |
+| `miaudit decision add --file decision.json` | Append a typed proposal, alternatives, rationale, risks and evidence references |
+| `miaudit evidence add --file evidence.json` | Submit attributed evidence under the caller's allowed producer type |
+| `miaudit check <check-id>` | Request a registered harness check against an immutable staged snapshot |
+| `miaudit gaps` | Explain missing fields, unsupported capture and policy requirements |
+| `miaudit commit -m <description>` | Create an immutable audit commit from staged file state and selected evidence |
+| `miaudit bind <audit-id> --git-commit <sha>` | Request verified linkage to an actual Git revision |
+| `miaudit log` / `miaudit show <audit-id>` | Inspect audit history and a specific manifest |
+| `miaudit verify <audit-id>` | Verify available digests, signatures, references and coverage requirements |
+| `miaudit push` / `miaudit fetch` | Synchronize authorized immutable audit objects and server receipts |
+| `miaudit review request <audit-id>` | Request human disposition over an exact manifest |
+| `miaudit approve <audit-id> --scope <scope>` | Record an explicit disposition through separate human authentication |
 
 Machine output uses versioned JSON, with stable exit codes for validation failure, conflict, insufficient evidence, authorization failure and transport failure. Interactive text is an alternate rendering of the same response. Secrets must not be supplied in command arguments.
 
-`audit commit` creates an audit object, not a Git commit, and does not imply policy success or approval. A policy requiring complete evidence can block release while allowing an incomplete audit commit to preserve the history. `audit push` confirms storage only after server acknowledgement. Local history can be inspected offline; restricted operations and release gates require authenticated verification.
+`miaudit commit` creates an audit object, not a Git commit, and does not imply policy success or approval. A policy requiring complete evidence can block release while allowing an incomplete audit commit to preserve the history. `miaudit push` confirms storage only after server acknowledgement. Local history can be inspected offline; restricted operations and release gates require authenticated verification.
 
 ## 3. Files, staging and hashes
 
-An audit index captures exact staged bytes and file metadata. Later workspace edits do not mutate the index: `audit status` shows divergence, and checks use the indexed snapshot. Each snapshot identifies the Git baseline and the complete auditable tree or explicit exclusions, not just a list of interesting paths.
+An audit index captures exact staged bytes and file metadata. Later workspace edits do not mutate the index: `miaudit status` shows divergence, and checks use the indexed snapshot. Each snapshot identifies the Git baseline and the complete auditable tree or explicit exclusions, not just a list of interesting paths.
 
 Each changed entry records repository-relative path, operation (`add`, `modify`, `delete`, `type_change`), object kind, file mode, before and after content digests where applicable, size, and artifact availability. Deletions have no after digest. Renames are optional asserted relationships between deletion and addition; content similarity alone does not establish intent.
 
@@ -149,7 +149,7 @@ An optional AI extraction service may turn transcripts into draft structured pro
 
 ## 8. No-UI workflow
 
-A developer initializes the repository, starts the harness, stages modified files, records context and decisions through CLI or MCP, runs registered checks, and creates an audit commit. The API binds it to the resulting Git revision. A reviewer reads `audit show --json` or a text rendering and authenticates separately to approve the exact audit ID and revision scope.
+A developer initializes the repository, starts the harness, stages modified files, records context and decisions through CLI or MCP, runs registered checks, and creates an audit commit. The API binds it to the resulting Git revision. A reviewer reads `miaudit show --json` or a text rendering and authenticates separately to approve the exact audit ID and revision scope.
 
 Agents hold only agent credentials. Human CLI approval requires a separate interactive enterprise authentication flow and explicit confirmation of the manifest digest; an agent invoking the binary cannot become a human merely by selecting an approval subcommand. CI uses its own service identity for build attestations and release-policy queries.
 

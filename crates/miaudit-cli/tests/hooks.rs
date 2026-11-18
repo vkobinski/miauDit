@@ -9,7 +9,7 @@ use std::{
 use tempfile::TempDir;
 
 fn audit(dir: &Path, args: &[&str]) -> (i32, Value) {
-    let out = Command::new(env!("CARGO_BIN_EXE_miaudit")).current_dir(dir).arg("--json").args(args).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_miaudit")).env("MIAUDIT_GITHUB_USER", "test-user").current_dir(dir).arg("--json").args(args).output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("not json: {}", String::from_utf8_lossy(&out.stdout)));
     (out.status.code().unwrap(), v)
 }
@@ -67,7 +67,7 @@ fn subjects(d: &Path, code: &str) -> Vec<String> {
 }
 
 fn log_text(d: &Path) -> String {
-    fs::read_to_string(d.join(".audit/events.jsonl")).unwrap()
+    fs::read_to_string(d.join(".miaudit/events.jsonl")).unwrap()
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn capture_records_prompt_edit_and_command_without_content() {
     assert!(recent[1]["data"]["digest_after"].as_str().unwrap().starts_with("sha256:"));
     assert_eq!(recent[2]["data"]["program"], "curl");
     let blob = recent[0]["data"]["prompt_blob"].as_str().unwrap().trim_start_matches("sha256:").to_string();
-    assert_eq!(fs::read_to_string(p.join(".audit/blobs").join(blob)).unwrap(), "please add a.txt");
+    assert_eq!(fs::read_to_string(p.join(".miaudit/blobs").join(blob)).unwrap(), "please add a.txt");
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn tampering_with_the_event_log_is_detected() {
     for _ in 0..3 {
         edit_event(p, "a.txt", "Write");
     }
-    let path = p.join(".audit/events.jsonl");
+    let path = p.join(".miaudit/events.jsonl");
     let lines: Vec<String> = fs::read_to_string(&path).unwrap().lines().map(String::from).collect();
     fs::write(&path, format!("{}\n{}\n", lines[0], lines[2])).unwrap();
     let (code, v) = audit(p, &["events"]);
@@ -154,7 +154,7 @@ fn editing_the_audit_store_with_a_tool_is_flagged() {
     let d = repo();
     let p = d.path();
     captured(p, json!({"hook_event_name": "PostToolUse", "cwd": p, "tool_name": "Edit",
-        "tool_input": {"file_path": p.join(".audit/HEAD")}, "tool_response": {}}));
+        "tool_input": {"file_path": p.join(".miaudit/HEAD")}, "tool_response": {}}));
     assert_eq!(subjects(p, "AUDIT_STORE_TOUCHED_BY_TOOL").len(), 1);
 }
 
@@ -174,8 +174,12 @@ fn commit_attaches_observed_events_and_verify_checks_the_chain() {
     let m = &shown["result"]["manifest"];
     let caps: Vec<(&str, &str)> = m["coverage"].as_array().unwrap().iter().map(|c| (c["capability"].as_str().unwrap(), c["provenance"].as_str().unwrap())).collect();
     assert!(caps.contains(&("hook_file_edits", "observed")));
-    assert!(caps.contains(&("hook_user_prompts", "observed")));
-    assert!(!caps.iter().any(|(n, _)| *n == "hook_command_digests"), "no commands were observed");
+    assert!(caps.contains(&("conversation_capture", "observed")));
+    assert!(caps.contains(&("command_execution_receipts", "unavailable")), "no commands were observed");
+    let codes: Vec<&str> = m["gaps"].as_array().unwrap().iter().map(|g| g["code"].as_str().unwrap()).collect();
+    assert!(codes.contains(&"CAPTURE_PARTIAL:conversation_capture"));
+    assert!(codes.contains(&"CAPTURE_UNAVAILABLE:command_execution_receipts"));
+    assert!(!codes.contains(&"CAPTURE_UNAVAILABLE:conversation_capture"));
     let evid = shown["result"]["objects"]["evidence"].as_array().unwrap();
     assert_eq!(evid.len(), 1);
     assert_eq!(evid[0]["object"]["provenance"], "observed");
@@ -208,7 +212,7 @@ fn altering_an_attached_event_blob_fails_verification() {
         let evd = shown["result"]["objects"]["evidence"][0]["object"]["body"]["artifact"]["digest"].as_str().unwrap().to_string();
         evd.trim_start_matches("sha256:").to_string()
     };
-    let blob = p.join(".audit/blobs").join(digest);
+    let blob = p.join(".miaudit/blobs").join(digest);
     let mut text = fs::read_to_string(&blob).unwrap();
     text = text.replacen("\"a.txt\"", "\"z.txt\"", 1);
     fs::write(&blob, text).unwrap();
