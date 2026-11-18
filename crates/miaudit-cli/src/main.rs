@@ -48,7 +48,10 @@ enum Cmd {
     Bindings { audit_id: Option<String> },
     Related { git_commit: String },
     Events,
-    Capture,
+    Capture {
+        #[arg(long, value_enum, default_value = "claude-code")]
+        agent: events::Agent,
+    },
     StopCheck,
     Show { id: String },
     Verify { id: String },
@@ -83,7 +86,7 @@ fn run(cli: &Cli) -> error::Res<Out> {
         Cmd::Bindings { audit_id } => commands::bindings(&ctx, audit_id.as_deref()),
         Cmd::Related { git_commit } => commands::related(&ctx, git_commit),
         Cmd::Events => commands::events_status(&ctx),
-        Cmd::Capture | Cmd::StopCheck => unreachable!("handled before the JSON envelope"),
+        Cmd::Capture { .. } | Cmd::StopCheck => unreachable!("handled before the JSON envelope"),
         Cmd::Show { id } => commands::show(&ctx, id),
         Cmd::Verify { id } => commands::verify(&ctx, id),
     }
@@ -138,10 +141,10 @@ fn run_hook(cmd: &Cmd) -> ! {
         std::process::exit(0);
     };
     match cmd {
-        Cmd::Capture => {
+        Cmd::Capture { agent } => {
             let res = match &input {
-                Some(v) => events::capture(&ctx.store, &ctx.cwd, v),
-                None => events::capture_unparsed(&ctx.store, "hook input was not valid JSON or exceeded the size limit", buf.len() as u64),
+                Some(v) => events::capture(&ctx.store, &ctx.cwd, v, *agent).map(|_| ()),
+                None => events::capture_unparsed(&ctx.store, "hook input was not valid JSON or exceeded the size limit", buf.len() as u64, *agent).map(|_| ()),
             };
             if let Err(e) = res {
                 eprintln!("miaudit: capture failed: {}", e.rule);
@@ -165,7 +168,7 @@ fn run_hook(cmd: &Cmd) -> ! {
 
 fn main() {
     let cli = Cli::parse();
-    if matches!(cli.cmd, Cmd::Capture | Cmd::StopCheck) {
+    if matches!(cli.cmd, Cmd::Capture { .. } | Cmd::StopCheck) {
         run_hook(&cli.cmd);
     }
     let (envelope, exit) = match run(&cli) {

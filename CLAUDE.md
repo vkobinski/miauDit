@@ -33,6 +33,7 @@ An audit commit says what was recorded about a change; a Git commit is where the
 
 Optional, and **not active unless the user merges it into `.claude/settings.json`**: `crates/miaudit-cli/hooks/claude-code.settings.json` wires Claude Code hooks to `miaudit capture` (prompts, file edits, command digests) and `miaudit stop-check` (blocks the first Stop when edits were observed but not audited).
 
+- Codex: `crates/miaudit-cli/hooks/codex.hooks.json` is the equivalent for the OpenAI Codex CLI (copy to `.codex/hooks.json`, then trust it in `/hooks`). It runs `miaudit capture --agent codex`; `apply_patch` edits become one `file_edit` event per file in the patch (add, update, delete, move_from, move_to). Not installed, not exercised against a real Codex run.
 - Events are written by the harness through the hook, not by the agent, so they are labelled `observed`. They go to `.audit/events.jsonl`, a hash-chained append-only log. `miaudit events` shows chain status and recent events.
 - No command text, tool output or file contents are stored, only digests; the user's prompt goes to an unencrypted blob. Redaction is still not implemented.
 - `miaudit commit` attaches the new events as one `observed` evidence object and advances a cursor. Gaps cross-check events against the snapshot: `STAGED_WITHOUT_OBSERVED_EDIT`, `STAGED_DIFFERS_FROM_OBSERVED`, `OBSERVED_EDIT_NOT_STAGED`, `AUDIT_STORE_TOUCHED_BY_TOOL`, `EVENT_CHAIN_BROKEN`, `NO_OBSERVED_EVENTS`. Report them as they are.

@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.cargo/bin/miaudit capture --agent codex", "timeout": 30 } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "^(Bash|apply_patch)$",
+        "hooks": [ { "type": "command", "command": "$HOME/.cargo/bin/miaudit capture --agent codex", "timeout": 30 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.cargo/bin/miaudit stop-check", "timeout": 30 } ] }
+    ]
+  }
+}

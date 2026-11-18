@@ -124,7 +124,7 @@ impl<'a> Log<'a> {
         Ok(self.read_all()?.into_iter().filter(|e| e.body.seq > c).collect())
     }
 
-    pub fn append(&self, hook: &str, session_id: Option<String>, tool: Option<String>, kind: &str, data: Value) -> Res<Event> {
+    pub fn append(&self, source: &str, hook: &str, session_id: Option<String>, tool: Option<String>, kind: &str, data: Value) -> Res<Event> {
         let lock = fs::OpenOptions::new().create(true).append(true).open(self.store.dir.join(LOCK_FILE))?;
         lock.lock()?;
         let (seq, prev) = match last_event(&self.path())? {
@@ -139,7 +139,7 @@ impl<'a> Log<'a> {
             at: now(),
             clock_authority: "local_device_unverified".into(),
             provenance: Provenance::Observed,
-            source: "claude_code_hook".into(),
+            source: source.into(),
             hook: hook.into(),
             session_id,
             tool,
@@ -189,10 +189,7 @@ pub fn program_of(command: &str) -> String {
     base.chars().take(64).collect()
 }
 
-fn edit_data(store: &Store, cwd: &Path, tool: &str, input: &Value) -> Value {
-    let Some(p) = str_field(input, "file_path").or_else(|| str_field(input, "notebook_path")) else {
-        return json!({"path": null, "note": "tool input has no file_path"});
-    };
+fn file_data(store: &Store, cwd: &Path, p: &str, operation: &str) -> Value {
     let given = Path::new(p);
     let joined = if given.is_absolute() { given.to_path_buf() } else { cwd.join(given) };
     let fixed = match (joined.parent().and_then(|d| d.canonicalize().ok()), joined.file_name()) {
@@ -202,7 +199,7 @@ fn edit_data(store: &Store, cwd: &Path, tool: &str, input: &Value) -> Value {
     match snapshot::resolve(&store.root, cwd, &fixed.to_string_lossy()) {
         Ok((abs, rel)) => {
             let digest = fs::symlink_metadata(&abs).ok().filter(|m| m.is_file()).and_then(|_| snapshot::capture(&abs, &rel).ok()).map(|(e, _)| e.digest);
-            json!({"path": rel, "operation": tool.to_ascii_lowercase(), "digest_after": digest})
+            json!({"path": rel, "operation": operation, "digest_after": digest})
         }
         Err(e) if e.rule.contains("excluded from capture") => {
             json!({"touches_audit_store": p.contains(".audit"), "touches_git_dir": p.contains(".git"), "path_as_given": p})
@@ -211,38 +208,108 @@ fn edit_data(store: &Store, cwd: &Path, tool: &str, input: &Value) -> Value {
     }
 }
 
-pub fn capture(store: &Store, cwd: &Path, input: &Value) -> Res<Event> {
+const MAX_PATCH_FILES: usize = 256;
+
+pub fn patch_files(text: &str) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    if !text.contains("*** Begin Patch") {
+        return out;
+    }
+    for line in text.lines() {
+        let l = line.trim_end();
+        if out.len() >= MAX_PATCH_FILES {
+            break;
+        }
+        if let Some(p) = l.strip_prefix("*** Add File: ") {
+            out.push(("add", p.trim().to_string()));
+        } else if let Some(p) = l.strip_prefix("*** Update File: ") {
+            out.push(("update", p.trim().to_string()));
+        } else if let Some(p) = l.strip_prefix("*** Delete File: ") {
+            out.push(("delete", p.trim().to_string()));
+        } else if let Some(p) = l.strip_prefix("*** Move to: ") {
+            if let Some(last) = out.last_mut()
+                && last.0 == "update"
+            {
+                last.0 = "move_from";
+            }
+            out.push(("move_to", p.trim().to_string()));
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Agent {
+    ClaudeCode,
+    Codex,
+}
+
+impl Agent {
+    pub fn source(self) -> &'static str {
+        match self {
+            Agent::ClaudeCode => "claude_code_hook",
+            Agent::Codex => "codex_hook",
+        }
+    }
+}
+
+pub fn capture(store: &Store, cwd: &Path, input: &Value, agent: Agent) -> Res<Vec<Event>> {
     let log = Log::new(store);
     let hook = str_field(input, "hook_event_name").unwrap_or("unknown");
     let session = str_field(input, "session_id").map(|s| s.chars().take(128).collect::<String>());
     let tool = str_field(input, "tool_name").map(|s| s.chars().take(64).collect::<String>());
     let empty = json!({});
     let tin = input.get("tool_input").unwrap_or(&empty);
+    let command_text = tin.as_str().or_else(|| str_field(tin, "command")).unwrap_or("");
     let failed = hook == "PostToolUseFailure";
-    let (kind, data) = match (hook, tool.as_deref()) {
+    let post = matches!(hook, "PostToolUse" | "PostToolUseFailure");
+    let mut items: Vec<(&str, Value)> = Vec::new();
+    match (hook, tool.as_deref()) {
         ("UserPromptSubmit", _) => {
             let prompt = str_field(input, "prompt").unwrap_or("");
             let digest = store.put_blob(prompt.as_bytes())?;
-            ("user_prompt", json!({"prompt_blob": digest, "prompt_bytes": prompt.len() as u64}))
+            items.push(("user_prompt", json!({"prompt_blob": digest, "prompt_bytes": prompt.len() as u64})));
         }
-        ("PostToolUse" | "PostToolUseFailure", Some("Bash")) => {
-            let cmd = str_field(tin, "command").unwrap_or("");
+        (_, Some("Bash")) if post => {
             let interrupted = input.get("tool_response").and_then(|r| r.get("interrupted")).and_then(Value::as_bool);
-            ("command", json!({"program": program_of(cmd), "command_digest": content_id(cmd.as_bytes()), "command_bytes": cmd.len() as u64, "failed": failed, "interrupted": interrupted}))
+            items.push(("command", json!({"program": program_of(command_text), "command_digest": content_id(command_text.as_bytes()), "command_bytes": command_text.len() as u64, "failed": failed, "interrupted": interrupted})));
+            for (op, path) in patch_files(command_text) {
+                let mut d = file_data(store, cwd, &path, op);
+                d["failed"] = json!(failed);
+                items.push(("file_edit", d));
+            }
         }
-        ("PostToolUse" | "PostToolUseFailure", Some(t @ ("Edit" | "Write" | "MultiEdit" | "NotebookEdit"))) => {
-            let mut d = edit_data(store, cwd, t, tin);
+        (_, Some("apply_patch")) if post => {
+            let files = patch_files(command_text);
+            if files.is_empty() {
+                items.push(("tool_call", json!({"failed": failed, "unparsed_patch": true})));
+            }
+            for (op, path) in files {
+                let mut d = file_data(store, cwd, &path, op);
+                d["failed"] = json!(failed);
+                items.push(("file_edit", d));
+            }
+        }
+        (_, Some(t @ ("Edit" | "Write" | "MultiEdit" | "NotebookEdit"))) if post => {
+            let mut d = match str_field(tin, "file_path").or_else(|| str_field(tin, "notebook_path")) {
+                Some(p) => file_data(store, cwd, p, &t.to_ascii_lowercase()),
+                None => json!({"path": null, "note": "tool input has no file_path"}),
+            };
             d["failed"] = json!(failed);
-            ("file_edit", d)
+            items.push(("file_edit", d));
         }
-        ("PostToolUse" | "PostToolUseFailure", _) => ("tool_call", json!({"failed": failed})),
-        _ => ("other_hook", json!({})),
-    };
-    log.append(hook, session, tool, kind, data)
+        _ if post => items.push(("tool_call", json!({"failed": failed}))),
+        _ => items.push(("other_hook", json!({}))),
+    }
+    let mut out = Vec::new();
+    for (kind, data) in items {
+        out.push(log.append(agent.source(), hook, session.clone(), tool.clone(), kind, data)?);
+    }
+    Ok(out)
 }
 
-pub fn capture_unparsed(store: &Store, reason: &str, bytes: u64) -> Res<Event> {
-    Log::new(store).append("unparsed", None, None, "capture_error", json!({"reason": reason, "input_bytes": bytes}))
+pub fn capture_unparsed(store: &Store, reason: &str, bytes: u64, agent: Agent) -> Res<Event> {
+    Log::new(store).append(agent.source(), "unparsed", None, None, "capture_error", json!({"reason": reason, "input_bytes": bytes}))
 }
 
 #[derive(Default)]
