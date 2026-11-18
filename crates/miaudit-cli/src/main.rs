@@ -4,6 +4,7 @@ mod events;
 mod git;
 mod github;
 mod project;
+mod push;
 mod snapshot;
 mod store;
 
@@ -67,6 +68,12 @@ enum Cmd {
     Project { #[command(subcommand)] op: ProjectOp },
     Show { id: String },
     Verify { id: String },
+    Push {
+        #[arg(long)]
+        server: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -116,6 +123,7 @@ fn run(cli: &Cli) -> error::Res<Out> {
         Cmd::Capture { .. } | Cmd::StopCheck { .. } | Cmd::SessionStart => unreachable!("handled before the JSON envelope"),
         Cmd::Show { id } => commands::show(&ctx, id),
         Cmd::Verify { id } => commands::verify(&ctx, id),
+        Cmd::Push { server, name } => push::push(&ctx, server.as_deref(), name.as_deref()),
     }
 }
 

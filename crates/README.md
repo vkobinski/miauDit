@@ -3,8 +3,9 @@
 Offline implementation of the CLI core described in `docs/cli-and-normalized-api.md`. Rust, unix only.
 
 - `miaudit-schema`: versioned types, strict closed-schema input validation, canonical serialization (`auditai-c14n-v1`), domain-separated SHA-256 IDs, tree digests and diffs.
-- `miaudit-cli` (binary `miaudit`): `init`, `status`, `add`, `diff [--staged]`, `context|decision|evidence add --file`, `gaps`, `commit -m`, `log`, `show`, `verify`, Git linking (`bind`, `bind-pending`, `git-hook install`, `bindings`, `related`) and hook capture (`capture`, `stop-check`, `events`). Every command accepts `--json` (versioned envelope `contract_version: "1"`).
+- `miaudit-cli` (binary `miaudit`): `init`, `status`, `add`, `diff [--staged]`, `context|decision|evidence add --file`, `gaps`, `commit -m`, `log`, `show`, `verify`, `push`, Git linking (`bind`, `bind-pending`, `git-hook install`, `bindings`, `related`) and hook capture (`capture`, `stop-check`, `events`). Every command accepts `--json` (versioned envelope `contract_version: "1"`).
 - `miaudit-ui` (binary `miaudit-ui`): read-only viewer on `http://127.0.0.1:7070`. See below.
+- `miaudit-server` (binary `miaudit-server`): team server with a GitHub-style UI over MongoDB. See below.
 
 Exit codes: `0` ok, `1` internal, `2` validation/integrity failure, `3` conflict, `4` insufficient evidence (partial verification).
 
@@ -31,8 +32,18 @@ Each repository has a `.miaudit/` directory at its root (found by walking up, li
 ## Viewer
 `miaudit-ui --repo <path> [--port 7070]` serves a read-only page of audit commits, their Git links, context, decisions, evidence, gaps and a live `miaudit verify` result. GET only, `127.0.0.1` only, strict `Host` check against DNS rebinding, no JavaScript, all content HTML-escaped, strict CSP. It runs `~/.cargo/bin/miaudit` for verification (override with `--audit-bin`); a bare `miaudit` is never used because on macOS it resolves to the system tool.
 
+## Team server
+`miaudit-server serve` hosts audit commits from many repositories in one MongoDB database. Pages: `/` (repository list with search), `/{owner}/{name}` (audit commits, authors, paging, `?author=` filter), `/{owner}/{name}/audit/{id}` (the same detail view as the local viewer, with integrity checks computed from what the server holds).
+- Setup: `MIAUDIT_MONGO_URI` (default `mongodb://127.0.0.1:27017`) and `MIAUDIT_MONGO_DB` (default `miaudit`). `miaudit-server token create <name>` prints a push token once (only its SHA-256 is stored); `token list` and `token revoke <name>` manage them. `serve --bind --port` (default `127.0.0.1:7171`).
+- Push: `MIAUDIT_SERVER=https://host MIAUDIT_TOKEN=... miaudit push [--name owner/name]`. The token is read from the environment only. The slug comes from the GitHub `origin` remote, otherwise `local/<directory>`; a slug can belong to one repository id only (conflict exits 3). Push is incremental and idempotent: the client asks which commits, objects, blobs and bindings the server lacks and sends only those (blobs, objects, commits, then bindings). Exit 4 if something referenced is missing locally.
+- The server never trusts the client: every blob must hash to its digest, every context, decision and evidence object to its id, every manifest to its audit id and tree digest, every binding to its binding id, and a manifest must belong to the repository it is filed under. Mismatches are refused with 422. Objects are immutable; re-sending identical content is a no-op, different content under an existing id cannot happen because ids are hashes.
+- Storage: collections `repos`, `audits`, `objects`, `blobs`, `bindings`, `tokens`, each keyed by repository id with unique indexes. Documents keep the exact JSON text received next to a few extracted fields used for listing, because verification needs the original bytes. Blobs are stored in the document (15 MB limit under MongoDB's 16 MB cap); GridFS is the way past that.
+- Access: pushing needs a token. Reading has no user accounts yet: set `MIAUDIT_SERVER_READ_PASSWORD` for one shared HTTP Basic password; without it, anyone who can reach the port can read every audit, and the server warns when bound to a non-loopback address. Tokens are team-wide, not scoped to a repository. Serve it behind TLS: tokens and the password cross the network otherwise (`push` warns on plain http to a non-local host).
+- What the server verifies is hashes. The event chain from hook capture is not re-checked there (run `miaudit verify` locally), and nothing proves who pushed: the author shown is what the manifest says.
+- Tests: `cargo test --workspace` runs the server suites against a real MongoDB when `MIAUDIT_TEST_MONGO_URI` is set (each test uses its own database) and prints `SKIPPED` otherwise; `scripts/e2e.sh` has a server section under the same variable.
+
 ## What it does not do (still open in the docs)
-No MCP server, trusted harness, full execution receipts (only command digests via hooks), `check`, `push`/`fetch`, `review`/`approve`, policy evaluation, signatures or server. Local blobs are **not encrypted** and no retention policy is applied; the capture coverage table and gaps no longer list `local_encryption` or `developer_review_observation`, so this README and `CLAUDE.md` are the only places that say blobs are unencrypted and that no review or approval flow exists.
+No MCP server, trusted harness, full execution receipts (only command digests via hooks), `check`, `fetch`, `review`/`approve`, policy evaluation, signatures, user accounts or per-repository permissions. Local blobs are **not encrypted** and no retention policy is applied; the capture coverage table and gaps no longer list `local_encryption` or `developer_review_observation`, so this README and `CLAUDE.md` are the only places that say blobs are unencrypted and that no review or approval flow exists.
 
 ## Trust model implemented here
 - Everything supplied by a caller is stored as `self_reported`; only hook events written through `miaudit capture` are `observed`. File snapshots are labeled `unverified_client_snapshot`: the CLI is not a trusted harness.
