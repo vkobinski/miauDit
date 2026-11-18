@@ -1,19 +1,21 @@
 pub mod db;
 pub mod ingest;
-pub mod web;
 
 use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use base64::Engine;
 use db::{Db, DbError};
-use miaudit_ui::data::Verification;
+use miaudit_ui::{
+    api::{self, RowFields},
+    data::Verification,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -37,19 +39,19 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     let read = Router::new()
-        .route("/", get(home))
+        .route("/api/v1/config", get(config))
         .route("/api/v1/repos", get(api_repos))
-        .route("/{owner}/{name}", get(repo_page))
-        .route("/{owner}/{name}/audit/{id}", get(audit_page))
-        .route("/{owner}/{name}/audit/{id}/evidence/{eid}/image", get(evidence_image))
+        .route("/{owner}/{name}/api/repo", get(repo_info))
         .route("/{owner}/{name}/api/audits", get(api_audits))
         .route("/{owner}/{name}/api/audits/{id}", get(api_audit))
+        .route("/{owner}/{name}/api/audits/{id}/detail", get(audit_detail))
+        .route("/{owner}/{name}/api/audits/{id}/evidence/{eid}/image", get(evidence_image))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_read));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(push)
         .merge(read)
-        .fallback(|| async { html(StatusCode::NOT_FOUND, web::message("Not found", "No such page.")) })
+        .fallback(spa)
         .layer(middleware::from_fn(secure_headers))
         .with_state(state)
 }
@@ -57,7 +59,7 @@ pub fn router(state: AppState) -> Router {
 async fn secure_headers(req: Request, next: Next) -> Response {
     let mut res = next.run(req).await;
     let h = res.headers_mut();
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(miaudit_web::CSP));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -68,20 +70,34 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-async fn require_read(State(s): State<Shared>, req: Request, next: Next) -> Response {
-    let Some(expected) = &s.read_password else { return next.run(req).await };
-    let supplied = req
-        .headers()
+fn authorized(s: &AppState, headers: &HeaderMap) -> bool {
+    let Some(expected) = &s.read_password else { return true };
+    let supplied = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic "))
         .and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok())
         .and_then(|v| String::from_utf8(v).ok())
         .and_then(|v| v.split_once(':').map(|(_, p)| p.to_string()));
-    if supplied.is_some_and(|p| ct_eq(p.as_bytes(), expected.as_bytes())) {
-        return next.run(req).await;
-    }
+    supplied.is_some_and(|p| ct_eq(p.as_bytes(), expected.as_bytes()))
+}
+
+fn challenge() -> Response {
     (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, r#"Basic realm="miauDit""#)], "authentication required").into_response()
+}
+
+async fn require_read(State(s): State<Shared>, req: Request, next: Next) -> Response {
+    if authorized(&s, req.headers()) { next.run(req).await } else { challenge() }
+}
+
+async fn spa(State(s): State<Shared>, method: Method, headers: HeaderMap, uri: Uri) -> Response {
+    if !authorized(&s, &headers) {
+        return challenge();
+    }
+    if method != Method::GET && method != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    miaudit_web::serve(uri.path())
 }
 
 async fn require_token(State(s): State<Shared>, req: Request, next: Next) -> Response {
@@ -94,10 +110,6 @@ async fn require_token(State(s): State<Shared>, req: Request, next: Next) -> Res
         },
         None => api_error(StatusCode::UNAUTHORIZED, "NO_TOKEN", "send Authorization: Bearer <token>"),
     }
-}
-
-fn html(status: StatusCode, body: String) -> Response {
-    (status, Html(body)).into_response()
 }
 
 fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
@@ -117,11 +129,6 @@ fn db_error(e: DbError) -> Response {
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "DATABASE", "database error")
         }
     }
-}
-
-fn page_error(e: DbError) -> Response {
-    eprintln!("miaudit-server: {e:?}");
-    html(StatusCode::INTERNAL_SERVER_ERROR, web::message("Database error", "The audit database could not be read."))
 }
 
 #[derive(Deserialize)]
@@ -181,16 +188,12 @@ struct HomeQuery {
     q: Option<String>,
 }
 
-async fn home(State(s): State<Shared>, Query(q): Query<HomeQuery>) -> Response {
-    let term = q.q.unwrap_or_default();
-    match s.db.repo_stats(Some(&term)).await {
-        Ok(stats) => html(StatusCode::OK, web::home(&stats, &term)),
-        Err(e) => page_error(e),
-    }
+async fn config() -> Response {
+    Json(json!({"mode": "server", "repo": null})).into_response()
 }
 
-async fn api_repos(State(s): State<Shared>) -> Response {
-    match s.db.repo_stats(None).await {
+async fn api_repos(State(s): State<Shared>, Query(q): Query<HomeQuery>) -> Response {
+    match s.db.repo_stats(q.q.as_deref()).await {
         Ok(stats) => Json(json!({"repos": stats.iter().map(|r| json!({
             "slug": r.repo.slug, "repo_id": r.repo.repo_id, "remote_url": r.repo.remote_url,
             "audits": r.audits, "gaps": r.gaps, "last_audit_at": r.last_audit_at, "last_push_at": r.repo.last_push_at,
@@ -210,65 +213,26 @@ struct RepoQuery {
 async fn find_repo(s: &Shared, owner: &str, name: &str) -> Result<db::RepoDoc, Response> {
     let slug = format!("{owner}/{name}");
     if !ingest::valid_slug(&slug) {
-        return Err(html(StatusCode::NOT_FOUND, web::message("Not found", "No such repository.")));
+        return Err(api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "no such repository"));
     }
     match s.db.repo_by_slug(&slug).await {
         Ok(Some(r)) => Ok(r),
-        Ok(None) => Err(html(StatusCode::NOT_FOUND, web::message("Not found", "No such repository."))),
-        Err(e) => Err(page_error(e)),
+        Ok(None) => Err(api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "no such repository")),
+        Err(e) => Err(db_error(e)),
     }
 }
 
-async fn repo_page(State(s): State<Shared>, Path((owner, name)): Path<(String, String)>, Query(q): Query<RepoQuery>) -> Response {
+async fn repo_info(State(s): State<Shared>, Path((owner, name)): Path<(String, String)>) -> Response {
     let repo = match find_repo(&s, &owner, &name).await {
         Ok(r) => r,
         Err(r) => return r,
     };
-    let page = q.page.unwrap_or(1).max(1);
-    let result = async {
-        let (audits, total) = s.db.audit_page(&repo.repo_id, q.author.as_deref(), None, page).await?;
-        let ids: Vec<String> = audits.iter().map(|a| a.audit_id.clone()).collect();
-        let bindings = s.db.bindings_for(&repo.repo_id, &ids).await?;
-        let authors = s.db.authors(&repo.repo_id).await?;
-        Ok::<_, DbError>((audits, total, bindings, authors))
-    }
-    .await;
-    match result {
-        Ok((audits, total, bindings, authors)) => html(
-            StatusCode::OK,
-            web::repo(&web::RepoPage { repo: &repo, audits: &audits, bindings: &bindings, total, page, author: q.author.as_deref(), authors: &authors }),
-        ),
-        Err(e) => page_error(e),
-    }
-}
-
-async fn audit_page(State(s): State<Shared>, Path((owner, name, id)): Path<(String, String, String)>) -> Response {
-    let repo = match find_repo(&s, &owner, &name).await {
-        Ok(r) => r,
-        Err(r) => return r,
-    };
-    if !ingest::valid_audit_id(&id) {
-        return html(StatusCode::NOT_FOUND, web::message("Not found", "Invalid audit id."));
-    }
-    match s.db.load_view(&repo.repo_id, &id).await {
-        Ok(Some((view, checks))) => {
-            let integrity = if checks.iter().any(|c| c.1 == "fail") { "fail" } else if checks.iter().any(|c| c.1 == "partial") { "partial" } else { "pass" };
-            let ver = Verification::Result { integrity: integrity.into(), checks };
-            html(StatusCode::OK, web::audit(&repo, &view, &ver))
-        }
-        Ok(None) => html(StatusCode::NOT_FOUND, web::message("Not found", "No such audit commit in this repository.")),
-        Err(e) => page_error(e),
-    }
-}
-
-async fn evidence_image(State(s): State<Shared>, Path((owner, name, id, eid)): Path<(String, String, String, String)>) -> Response {
-    let Ok(repo) = find_repo(&s, &owner, &name).await else { return StatusCode::NOT_FOUND.into_response() };
-    if !ingest::valid_audit_id(&id) || !ingest::valid_object_id(&eid) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    match s.db.evidence_image(&repo.repo_id, &id, &eid).await {
-        Ok(Some((mime, bytes))) => ([(header::CONTENT_TYPE, mime), (header::CONTENT_DISPOSITION, "inline")], bytes).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+    match s.db.authors(&repo.repo_id).await {
+        Ok(authors) => Json(json!({
+            "repo": {"slug": repo.slug, "repo_id": repo.repo_id, "remote_url": repo.remote_url, "last_push_at": repo.last_push_at},
+            "authors": authors.into_iter().map(|(login, count)| json!({"login": login, "count": count})).collect::<Vec<_>>(),
+        }))
+        .into_response(),
         Err(e) => db_error(e),
     }
 }
@@ -287,11 +251,19 @@ async fn api_audits(State(s): State<Shared>, Path((owner, name)): Path<(String, 
     }
     .await;
     match result {
-        Ok((audits, total, bindings)) => Json(json!({"repo": repo.slug, "total": total, "page": page, "per_page": db::PAGE_SIZE, "audits": audits.iter().map(|a| json!({
-            "audit_id": a.audit_id, "created_at": a.created_at, "description": a.description, "author": a.author_login,
-            "changes": a.changes, "gaps": a.gaps, "gap_codes": a.gap_codes, "parents": a.parents,
-            "git": bindings.iter().filter(|b| b.body.audit_id == a.audit_id).map(|b| json!({"commit": b.body.git.commit, "correspondence": b.body.correspondence})).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>()}))
+        Ok((audits, total, bindings)) => Json(json!({"repo": repo.slug, "total": total, "page": page, "per_page": db::PAGE_SIZE, "audits": audits.iter().map(|a| api::audit_row(
+            &RowFields {
+                audit_id: &a.audit_id,
+                created_at: &a.created_at,
+                description: &a.description,
+                author: a.author_login.as_deref(),
+                changes: a.changes,
+                gaps: a.gaps,
+                gap_codes: &a.gap_codes,
+                parents: &a.parents,
+            },
+            api::git_links(&bindings, &a.audit_id),
+        )).collect::<Vec<_>>()}))
         .into_response(),
         Err(e) => db_error(e),
     }
@@ -307,6 +279,37 @@ async fn api_audit(State(s): State<Shared>, Path((owner, name, id)): Path<(Strin
     }
     match s.db.raw_commit(&repo.repo_id, &id).await {
         Ok(Some(raw)) => ([(header::CONTENT_TYPE, "application/json")], raw).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+async fn audit_detail(State(s): State<Shared>, Path((owner, name, id)): Path<(String, String, String)>) -> Response {
+    let repo = match find_repo(&s, &owner, &name).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    if !ingest::valid_audit_id(&id) {
+        return api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "invalid audit id");
+    }
+    match s.db.load_view(&repo.repo_id, &id).await {
+        Ok(Some((view, checks))) => {
+            let integrity = if checks.iter().any(|c| c.1 == "fail") { "fail" } else if checks.iter().any(|c| c.1 == "partial") { "partial" } else { "pass" };
+            let ver = Verification::Result { integrity: integrity.into(), checks };
+            Json(api::detail_json(&view, &ver)).into_response()
+        }
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "no such audit commit in this repository"),
+        Err(e) => db_error(e),
+    }
+}
+
+async fn evidence_image(State(s): State<Shared>, Path((owner, name, id, eid)): Path<(String, String, String, String)>) -> Response {
+    let Ok(repo) = find_repo(&s, &owner, &name).await else { return StatusCode::NOT_FOUND.into_response() };
+    if !ingest::valid_audit_id(&id) || !ingest::valid_object_id(&eid) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match s.db.evidence_image(&repo.repo_id, &id, &eid).await {
+        Ok(Some((mime, bytes))) => ([(header::CONTENT_TYPE, mime), (header::CONTENT_DISPOSITION, "inline")], bytes).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => db_error(e),
     }
