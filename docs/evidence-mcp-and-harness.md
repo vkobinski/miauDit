@@ -1,6 +1,6 @@
 # Evidence MCP and execution harness
 
-Status: proposed design, with no implementation. Extends the [product model](../README.md). Tool names, resource URIs and Rust module boundaries below are proposed miauDit contracts, not existing client capabilities.
+Status: proposed design. The MCP server and the trusted execution harness described here are not implemented; hook capture in the CLI is a partial stand-in (see [crates/README.md](../crates/README.md)). Extends the [product model](product-proposal.md). Tool names, resource URIs and Rust module boundaries below are proposed miauDit contracts, not existing client capabilities.
 
 ## 1. Two cooperating components
 
