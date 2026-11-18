@@ -375,3 +375,18 @@ async fn the_conversation_timeline_lives_inside_one_audit_with_prompts_shown_loc
     let checks: Vec<&str> = detail["verification"]["checks"].as_array().unwrap().iter().map(|c| c["check"].as_str().unwrap()).collect();
     assert!(checks.contains(&"checkpoints_integrity"), "{checks:?}");
 }
+
+#[tokio::test]
+async fn the_viewer_serves_the_pixel_icon_with_safe_headers() {
+    let (d, _) = fixture();
+    let app = app(&d);
+    let (s, h, _) = get(&app, "GET", "/icon-64.png", HOST).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["content-type"], "image/png");
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    assert!(h["content-security-policy"].to_str().unwrap().contains("img-src 'self'"));
+    let (_, _, shell) = get(&app, "GET", "/", HOST).await;
+    assert!(shell.contains(r#"rel="icon""#) && shell.contains("/icon-64.png"));
+    let (s, _, _) = get(&app, "GET", "/icon-64.png", "evil.example").await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "the Host check applies to assets too");
+}

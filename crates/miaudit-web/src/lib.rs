@@ -63,4 +63,17 @@ mod tests {
         assert_eq!(r.status(), StatusCode::OK);
         assert!(r.headers()[header::CONTENT_TYPE].to_str().unwrap().contains("javascript"));
     }
+
+    #[test]
+    fn the_pixel_icon_is_embedded_linked_from_the_shell_and_served_as_a_png() {
+        let index = String::from_utf8(Assets::get("index.html").expect("index").data.into_owned()).unwrap();
+        assert!(index.contains(r#"rel="icon""#) && index.contains("/icon-64.png"), "the shell links the favicon: {index}");
+        let r = serve("/icon-64.png");
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "image/png");
+        let bytes = Assets::get("icon-64.png").expect("icon embedded").data.into_owned();
+        assert_eq!(&bytes[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        assert_eq!((u32::from_be_bytes(bytes[16..20].try_into().unwrap()), u32::from_be_bytes(bytes[20..24].try_into().unwrap())), (64, 64));
+        assert_eq!(serve("/missing-icon.png").status(), StatusCode::OK, "an unknown path still gets the app shell, not a broken image");
+    }
 }
