@@ -1,261 +1,204 @@
+<div align="center">
+
+<img src="docs/images/logo.png" alt="miauDit logo: a cat saying miau" width="160">
+
 # miauDit
 
-**A system of record for AI-assisted software decisions, human approvals, and production provenance.**
+**A tamper-evident audit trail for AI-assisted code changes.**<br>
+What was asked, what the agent did, what evidence backs it, and where the record has holes.
 
-Status: product and architecture proposal. No implementation exists. Rust is the intended implementation language.
+![Rust 2024](https://img.shields.io/badge/rust-2024-orange)
+![Platform unix](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![Status early](https://img.shields.io/badge/status-early%20%E2%80%A2%20not%20signed-yellow)
 
-Implementation status: the first slice exists under `crates/` (see [crates/README.md](crates/README.md)): the offline local core of the CLI, without MCP, harness, server, policy engine, signatures or human approvals. The name is provisional and has not been checked for trademark or domain availability.
+[Quick start](#quick-start) ·
+[How it works](#how-it-works) ·
+[Commands](#commands) ·
+[Team server](#team-server) ·
+[What it proves](#what-it-proves-and-what-it-does-not) ·
+[Docs](#documentation)
 
-Detailed design: [Evidence MCP and execution harness](docs/evidence-mcp-and-harness.md). This defines how agents submit structured decisions and how a Rust harness independently captures execution evidence.
+</div>
 
-The next proposed delivery surface is a CLI and a normalized API, with no UI implementation: [CLI, audit commits and API contract](docs/cli-and-normalized-api.md). The CLI and MCP share typed domain operations; AI statements remain distinct from verified observations.
+---
 
-Detailed interaction capture: [Prompts, responses, authorizations and review evidence](docs/interaction-and-review-evidence.md). This links the conversation to command permissions, actual execution, file modifications and observable developer verification actions.
+A Git diff shows the result of a change. It does not show the request behind it, the files and tools the agent touched, the alternatives it rejected, or what a human actually decided. miauDit records that next to your code, in a form you can verify later.
 
-## 1. Product thesis
+> `miau` is how a cat says *meow* in Portuguese. The cat meows; miauDit writes it down.
 
-Banks, fintechs, and teams building critical software need to explain how a production change came into existence. A Git diff captures the result, but usually omits the instructions, source material, tool access, agent delegation, rejected alternatives, and human approvals that produced it.
+<p align="center">
+  <img src="docs/images/ui-audit.png" alt="An audit commit in the miauDit interface" width="820">
+</p>
 
-miauDit would provide a GitHub-like interface for this evidence. Every change would have an audit dossier linking agent activity to code, review, build artifacts, and deployment. Teams could answer:
+## Why
 
-- Who requested the change, and what constraints did they give the AI?
-- Which agent sessions contributed, including delegated agents?
-- Which documentation, files, datasets, and MCP tools were observed being accessed?
-- What recommendations and explanations were presented to the developer?
-- Which decisions did a human explicitly accept, reject, or modify?
-- Which exact revision was reviewed, built, and deployed?
-- Where is evidence missing, self-reported, or contradicted?
+- **Git keeps the what, not the why.** An audit commit keeps the request, the decisions with their alternatives and risks, and the evidence (test output, screenshots, command results) beside the exact files that changed.
+- **Honest about gaps.** Anything missing, self-reported or only partly captured is listed as a *gap* on the audit commit instead of being quietly left out.
+- **Agents do not grade themselves.** Everything an agent writes is labelled `self_reported`. Only events captured by hooks are `observed`. Nothing is marked approved unless a human approval exists, and none can be recorded yet.
+- **It runs where you work.** A local store in `.miaudit/`, a Claude Code hook integration, a read-only viewer, and an optional team server for many repositories.
 
-The initial product integrates with existing Git hosting rather than replacing it. Its own repository pages, diffs, timelines, review queues, and release dossiers supply the GitHub-like experience.
+## Features
 
-## 2. Boundaries of the claim
+| | |
+|---|---|
+| **Audit commits** | Content-addressed, parented like Git commits. The ID is the SHA-256 of the canonical manifest, so any change to the record changes the ID. |
+| **File snapshots** | Staged files are stored by hash with path, mode and size; a tree digest covers the lot. |
+| **Hook capture** | Claude Code and Codex hooks record prompts, edits, commands, reads, web and MCP calls, and subagents as hash-chained events. Commands and replies are kept as digests, never as text. |
+| **Conversation inside one audit** | At the end of each turn a *checkpoint* of hash-only event receipts is attached to the latest audit. The audit's hash never changes, and the whole conversation shows up in that one audit. |
+| **Decisions that can be corrected** | A new decision can *supersede* an old one; the viewer marks the old one and links the new. |
+| **Git and PR links** | `miaudit bind` ties an audit to a Git commit or a GitHub pull request and reports `full`, `partial` or `asserted`. |
+| **Evidence by change kind** | Frontend changes expect before/after screenshots, API changes expect before/after requests; missing pieces show up as gaps. |
+| **Viewer** | `miaudit ui` serves a React interface on `127.0.0.1`, read-only. |
+| **Team server** | `miaudit-server` keeps many repositories in MongoDB, with a GitHub-style UI and a token-gated `miaudit push`. |
 
-miauDit records observable actions and explicit decision records. It does not extract private model reasoning or claim to reconstruct an agent's internal thought process. An agent's explanation is attributed testimony, not independent proof of why it generated code.
+## Quick start
 
-Observed file access does not prove that a model understood or used the file. A visible response does not prove that a developer read it. Tool permission does not prove actual access. A commit author is not automatically the requester, reviewer, or production approver.
+You need Rust, Git, and Node.js 20.19+ (or 22.12+) to build the web interface.
 
-The product establishes evidence of actions and assigned organizational responsibility. It does not automatically determine legal liability, prove software correctness, or guarantee regulatory compliance. Missing telemetry must remain visible rather than becoming an implied clean audit.
-
-## 3. Primary users
-
-| User | Main workflow |
-| --- | --- |
-| Developer | Start an instrumented session, inspect collected evidence, explain decisions, submit a change |
-| Reviewer | Review code alongside agent inputs, access history, unresolved risks, and evidence gaps |
-| Security and compliance | Define controls, investigate sensitive access, export evidence for an audit |
-| Release approver | Authorize a specific artifact and destination environment |
-| Incident responder | Trace deployed behavior back to code, sessions, approvals, and source material |
-| Platform administrator | Operate collectors, identity, storage, retention, and integration policies |
-
-## 4. End-to-end workflow
-
-1. **Enroll a repository.** Connect Git hosting, enterprise identity, CI, and deployment systems. Select a versioned policy and data retention profile.
-2. **Start a session.** A local collector establishes developer identity, device identity, workspace, repository, base revision, agent client/version, and model identifier where available. It records active capture capabilities and gaps.
-3. **Capture context and actions.** Supported adapters record developer messages, visible agent outputs, tool calls, file reads and writes, documentation references, MCP access, command results, and delegation relationships. Sensitive content is filtered before upload.
-4. **Record decisions.** The agent or developer proposes a structured decision containing alternatives, a concise rationale, supporting evidence, affected code, and risks. Developers explicitly accept, amend, reject, or defer material decisions.
-5. **Bind evidence to a commit.** Capture the final tree and patch digest, parent revision, working changes, sessions, and policy version. Register an immutable dossier referencing the resulting commit SHA. Store this externally to avoid a circular dependency between commit contents and its own SHA.
-6. **Review the pull request.** miauDit presents the code diff, decision records, evidence coverage, sensitive access, and policy results. An approval binds the approver's identity and role to an exact revision and dossier digest.
-7. **Re-evaluate changes.** New code, new material evidence, or a policy-relevant correction creates another dossier revision and invalidates affected approvals. Policies define when fresh review is mandatory.
-8. **Bind the build and release.** CI attests to source revision, build inputs, test results, and artifact digest. Deployment records bind that digest to an environment, release approval, and time.
-9. **Investigate or export.** An auditor opens a production release and follows verified links back to its decisions and evidence. Exports include a signed manifest, policy evaluations, redactions, and verification instructions.
-
-Example: an agent changes a transfer limit after reading an internal risk policy through MCP. The developer rejects its proposed default, selects a lower limit, and explains why. A separate reviewer approves the resulting revision. The release dossier shows the policy document version, observed MCP access, original proposal, human amendment, passing checks, approver, and deployed artifact. If the document contents could not be captured, the dossier explicitly says what reference or digest remains available.
-
-## 5. What is captured
-
-| Category | Evidence to retain |
-| --- | --- |
-| Human context | Request text or redacted reference, constraints, attachments, corrections, identity, time |
-| Agent context | Client/version, reported model/version, system or project instructions when exposed, configuration and capability manifest |
-| Agent topology | Session and agent IDs, parent/child links, delegation purpose, tool permissions, start/end state |
-| Documentation | URI/path, observed version, content digest, capture time, permitted snapshot or excerpt |
-| Data access | Source, classification, operation, scope, resource identifier, outcome, redacted arguments and response references |
-| MCP | Server identity and version when available, tool/schema version, authenticated principal, invocation, result status and evidence references |
-| Local work | Repository/worktree identity, base tree, uncommitted input changes, patches, commands, exit status, output digests |
-| Recommendations | Output presented by the client where observable; otherwise output emitted, with presentation unverified |
-| Decisions | Proposal, alternatives, stated rationale, evidence links, disposition, actor and affected revision |
-| Verification | Check invocation, environment, result, logs or references, and which revision was checked |
-| Delivery | Commit/PR relationships, review events, build provenance, artifact digest, deployment and rollback events |
-
-Every category supports `observed`, `self-reported`, `derived`, `unavailable`, and `redacted` provenance labels as appropriate. Evidence coverage is reported per capability and interval; a single score must not conceal missing critical sources.
-
-## 6. Domain model
-
-All records are tenant-scoped. Stable identifiers are separate from Git SHAs and external provider identifiers.
-
-| Entity | Purpose and relationships |
-| --- | --- |
-| Organization / Project / Repository | Ownership, access boundaries, repository identity and policies |
-| Principal | Human, agent, service, or device identity; issuer and authentication provenance |
-| Session / AgentRun | One work session and its agent execution graph; many sessions may contribute to one commit |
-| ContextItem / ResourceAccess | Versioned context references and observed accesses, including classification and redaction |
-| EvidenceEvent | Immutable observation with producer, sequence, timestamp, provenance and artifact references |
-| EvidenceArtifact | Encrypted content or redacted snapshot, digest, storage reference and retention class |
-| Decision | Versioned proposal and explicit dispositions; supporting events and affected code |
-| ChangeSet / CommitBinding | Captured code change and its verified or asserted links to Git revisions |
-| AuditDossier | Immutable manifest assembling evidence for an exact revision; supersession links |
-| Approval | Attestation by a principal over a dossier/revision, role, scope and policy version |
-| Policy / PolicyEvaluation | Versioned rules and reproducible outcomes with reasons |
-| Build / Deployment | Source-to-artifact and artifact-to-environment links |
-| Exception | Authorized, scoped, expiring policy bypass with reason and follow-up owner |
-
-An event envelope would include a schema version, event ID, tenant/repository/session IDs, producer ID and sequence, event type, occurrence time, ingestion time, actor, parent/causal references, payload digest, artifact references, provenance label, redaction metadata, and producer signature where supported. Device clock time is not authoritative; receipt time and sequence provide additional ordering evidence.
-
-Decision lifecycle: `proposed → accepted | amended | rejected | deferred`, followed by explicit supersession where necessary. Each transition is a new event. Agent-generated summaries must retain links to original observations and identify their generator/version.
-
-## 7. Human responsibility and approvals
-
-Keep distinct roles: requester, session operator, decision owner, code author, reviewer, risk owner, and release approver. One person may hold multiple roles when policy permits; critical changes may require separation of duties.
-
-An acceptance must identify what the person accepted: a recommendation, a code revision, a documented risk, or a production release. Store identity, authentication method, server receipt time, statement, scope, and evidence digest. Never infer acceptance merely from continuing a chat, creating a commit, or clicking a generic tool permission prompt.
-
-Repository ownership defines responsibility assignments prospectively. miauDit records assignments and actions without generating developer blame scores. Break-glass releases require a named authorized actor, reason, scope, expiry, and retrospective review. Delegation does not silently transfer an approver's responsibility.
-
-## 8. Integration strategy
-
-Claude Code, Codex, and Grok are target integrations, not claims of currently available equivalent instrumentation. Before implementation, validate each client's documented extension points, supported versions, export formats, terms, and available telemetry.
-
-| Integration | Proposed approach | Known design constraint |
-| --- | --- | --- |
-| Claude Code | Adapter using supported hooks or session exports, supplemented by a managed launcher where needed | Coverage depends on documented client features and version |
-| Codex | Adapter using supported execution events, hooks or exports where available | Hosted and local execution may expose different evidence |
-| Grok | Adapter for the specific coding client or an organization-controlled API gateway | A model API alone cannot observe developer UI, local files, or external tools |
-| MCP | Instrument an organization-controlled gateway or participating MCP servers | Direct or unmanaged connections may bypass capture |
-| Git hosting | App/webhooks for repositories, PRs, reviews and commit discovery | Webhook signatures, deduplication and reconciliation are required |
-| CI/CD | Signed provenance and deployment ingestion; policy checks on exact revisions | CI identity and protected deployment permissions must be enforced externally |
-
-Each adapter declares a versioned capability manifest. Unsupported capture produces an evidence gap and a policy outcome. Manual imports are allowed but labeled as imports; they cannot retroactively establish trustworthy live capture.
-
-Launch with one validated client, Git provider, and CI path, then expand using a shared event schema. The first implementation milestone is a capability investigation and integration contract, before committing to automatic capture promises.
-
-## 9. Git provenance and difficult cases
-
-- **Several agents or developers:** preserve the contribution graph and distinct principals; do not assign every line to the session operator.
-- **Mixed manual and generated changes:** record contributions as observed or asserted. Patch overlap alone is insufficient proof of authorship.
-- **Squash, rebase and cherry-pick:** retain original bindings and add transformation records. Verify resulting trees/diffs; record uncertainty and require fresh approvals where policy demands it.
-- **Uncommitted inputs:** record relevant dirty workspace state, including files that influenced generation but never entered Git, subject to content policy.
-- **Offline sessions:** spool encrypted events locally with sequences and signatures. Show delayed ingestion and missing intervals; policies may prohibit release until synchronization completes.
-- **Bypassed collectors:** detect absence of expected attestations through protected CI/release gates. Do not claim that a local collector can prove no unobserved activity occurred.
-- **Rollback and emergency fixes:** create new deployment records and explicit exceptions rather than rewriting prior evidence.
-- **Retries and disorder:** use idempotent event IDs, producer sequences and causal links; preserve late events and issue updated dossier evaluations.
-
-## 10. Architecture in Rust
-
-Proposed logical components, initially deployed as a modular server plus local collector rather than many microservices:
-
-```text
-Agent clients / developer workspace / MCP gateway
-                    |
-            Rust collector + adapters
-       filtering, signing, encrypted local spool
-                    |
-             Rust ingestion API <--- Git / CI / deployment integrations
-                    |
-       immutable event store + encrypted artifact storage
-                    |
-       provenance assembler + policy evaluator
-                    |
-       query API ---> repository UI / audit exports / release checks
+```sh
+git clone https://github.com/vkobinski/miauDit.git
+cd miauDit
+cargo install --path crates/miaudit-cli --locked      # installs `miaudit`
+cargo install --path crates/miaudit-server --locked   # optional: the team server
 ```
 
-Candidate Rust modules: `audit-schema`, `audit-harness`, `audit-mcp`, `audit-collector`, `audit-adapters`, `audit-ingest`, `audit-provenance`, `audit-policy`, `audit-api`, and `audit-export`. The harness supervises execution and the collector records observations; the MCP server exposes scoped evidence tools to agents. These are proposed boundaries, not an instruction to scaffold code.
+> `~/.cargo/bin` is not always on `PATH`, and a bare `audit` on macOS is a different system tool. Use `miaudit`, with the full path if needed. For a smaller binary without the viewer and without Node, build with `--no-default-features`.
 
-Candidates to evaluate: Tokio for asynchronous execution, Axum for HTTP APIs, Serde for versioned event serialization, SQLx with PostgreSQL for metadata, and S3-compatible object storage for evidence artifacts. A Rust UI framework such as Leptos is an option if the web application must also be Rust; that choice remains open.
+In the repository you want to audit:
 
-Use transactional ingestion and an outbox for reliable downstream processing. PostgreSQL read models support repository timelines and investigations; object storage holds larger encrypted evidence. Search indexes are derived, rebuildable, and subject to the same tenant authorization and deletion rules. Start with database-backed jobs; introduce a separate broker only if load requires it.
+```sh
+miaudit init                 # creates .miaudit/ and links the Claude Code hooks
+```
 
-Support private-cloud or on-premises deployment for regulated customers, with customer-controlled keys, regional storage, private networking and optional restricted egress. Define availability, recovery objectives, event volume and artifact sizes during pilot discovery before selecting a topology.
+Work with your agent as usual. The hooks record what happens. When a piece of work is done:
 
-## 11. Evidence integrity and threat model
+```sh
+miaudit add src/lib.rs tests/lib.rs        # stage exactly what changed
+miaudit context add  --file context.json   # what was asked, constraints
+miaudit decision add --file decision.json  # choices, alternatives, risks
+miaudit evidence add --file evidence.json  # real test or command output
+miaudit commit -m "what changed and why"
+miaudit verify <audit_id>                  # re-hash everything
+miaudit gaps                               # what is still missing
+miaudit ui                                 # look at it in the browser
+```
 
-Threats include developer tampering, compromised collectors, forged identities, malicious agents, untrusted MCP outputs, administrator misuse, cross-tenant access, and evidence loss.
+Each JSON file is a small closed schema; unknown fields are rejected. Add `--json` to any command for machine output (exit codes: `0` ok, `2` validation or integrity failure, `3` conflict, `4` partial verification).
 
-Collectors sign event batches with enrolled device identities. Ingestion acknowledges accepted sequence ranges. Per-producer hash chains and signed server checkpoints expose modification or missing segments relative to a trusted checkpoint. Store checkpoints independently and support retention-locked object storage. Signatures establish provenance of a statement, not its truth; a compromised producer can still emit false evidence.
+## How it works
 
-Use enterprise identity for humans, short-lived credentials for services, separate signing keys, key rotation/revocation history, and independently audited administrative access. Verify external webhook signatures and reconcile periodically with source systems.
+```mermaid
+flowchart LR
+    A[AI agent<br/>Claude Code, Codex] -->|hooks| B[(events log<br/>hash chained)]
+    A -->|context, decisions,<br/>evidence| C[pending records]
+    F[staged files] --> D
+    B --> D{{miaudit commit}}
+    C --> D
+    D --> E[audit commit<br/>content addressed]
+    B -->|each turn, Stop hook| L[checkpoint<br/>attestation]
+    L -.->|attached, audit hash<br/>unchanged| E
+    E -->|bind| G[Git commit or PR]
+    E -->|verify| H[integrity checks]
+    E -->|push| I[(team server<br/>MongoDB)]
+    E --> J[miaudit ui]
+    I --> K[web interface]
+```
 
-Treat all captured prompts, documents and tool results as untrusted data. Escape rendered content, avoid executable attachments, and isolate any summarization agent from privileged actions. An instruction inside captured evidence must never alter policy evaluation.
+1. **Capture.** Hooks append events to `.miaudit/events.jsonl`, each one hashing the previous. Only digests, paths and hosts are stored for commands and replies; your own prompts are the only text kept.
+2. **Record.** The agent adds context, decisions and evidence. These are attributed testimony, stored as `self_reported`.
+3. **Commit.** `miaudit commit` snapshots the staged files, attaches the new events as one `observed` evidence object, computes the gaps, and writes an immutable audit commit.
+4. **Keep it current.** As the conversation goes on, the `Stop` hook attaches a checkpoint to the latest audit each turn. A checkpoint is an immutable attestation, like a Git link: it names the audit, chains to the previous checkpoint, and points at the new event receipts. It never changes the audit's ID, so one audit ends up holding the whole conversation. If the agent later learns something that makes a decision false, it records a new decision that *supersedes* the old one.
+5. **Verify and link.** `miaudit verify` recomputes every ID and digest, including each checkpoint's event chain; `miaudit bind` links the audit to the Git commit or PR where the change landed.
+6. **Share.** `miaudit push` sends the audit, its checkpoints and its Git links to a team server, which re-hashes everything it receives before storing it.
 
-Export verification checks manifest signatures, artifact digests, chains/checkpoints, key validity history and redaction declarations. It must identify unavailable artifacts and unverifiable links explicitly. Integrity proofs cannot prove collection completeness; managed environments and independent CI observations strengthen that assurance.
+Storage works like Git's object store: full file contents sit in `.miaudit/blobs/<sha256>`, records in `.miaudit/objects/`, audit commits in `.miaudit/commits/`. The store is gitignored.
 
-## 12. Sensitive data and retention
+## The interface
 
-The evidence store itself is highly sensitive: prompts and tool results may contain customer data, credentials, proprietary code or financial records.
+<p align="center">
+  <img src="docs/images/ui-repositories.png" alt="Repository list" width="49%">
+  <img src="docs/images/ui-repository.png" alt="Audit commits of a repository" width="49%">
+</p>
 
-Default to minimal collection with source classification, local redaction, secret filtering, and configurable metadata-only capture. Record that filtering occurred and which policy version applied. Do not assume content hashes anonymize low-entropy sensitive values; use keyed digests or omit them where appropriate.
+The audit page has a **Conversation** card: every prompt, command and reply recorded for that audit, in order, as one-line receipts. The local viewer also shows the prompt text from your machine; the team server shows only sizes, because prompt text is never pushed. The screenshot below is a sample with made-up prompts.
 
-Separate broadly visible metadata from restricted evidence payloads. Apply tenant isolation, repository authorization, field/artifact-level access, encryption in transit and at rest, and audited evidence viewing and export. Restricted artifacts must not leak through search, generated summaries, or cached previews.
+<p align="center">
+  <img src="docs/images/ui-conversation.png" alt="The Conversation card of an audit, with three checkpoints" width="760">
+</p>
 
-Define retention by evidence class and jurisdiction. Legal holds suspend eligible deletion. Payload deletion or cryptographic erasure creates a tombstone event while preserving only legally permitted metadata; backups and indexes must follow documented expiry procedures. This means append-only history does not imply permanent retention of every captured payload. Counsel and security teams must validate the retention policy for each deployment.
+`miaudit ui` serves the same React app for the current repository; the team server serves it for all of them. Both expose one JSON API, so the interface, `miaudit remote` and your own scripts read the same data. The viewer is read-only, listens on `127.0.0.1` only, checks the `Host` header, and runs under a strict CSP with no inline script.
 
-Do not collect passwords, API tokens, or unrestricted customer datasets merely to improve audit completeness. A scoped reference, access receipt, and approved document version may be the appropriate evidence.
+## Commands
 
-## 13. Policy model
+| Area | Commands |
+|---|---|
+| **Set up** | `miaudit init [--local] [--no-hooks]` · `miaudit project init` · `miaudit project check` · `miaudit git-hook install` |
+| **Record** | `miaudit add` · `miaudit context add` · `miaudit decision add` · `miaudit evidence add` · `miaudit commit -m` |
+| **Inspect** | `miaudit status` · `miaudit diff [--staged]` · `miaudit gaps` · `miaudit log` · `miaudit show <id>` · `miaudit events` |
+| **Verify and link** | `miaudit verify <id>` · `miaudit bind <id> --git-commit <rev> \| --pr <n>` · `miaudit bind-pending` · `miaudit bindings` · `miaudit related <rev>` |
+| **Hooks** | `miaudit capture` · `miaudit stop-check` · `miaudit session-start` · `miaudit checkpoints [on\|off]` |
+| **Share** | `miaudit push` · `miaudit remote repos \| audits \| show` · `miaudit ui [--port N]` |
 
-Policies are versioned, deterministic rules evaluated against a dossier and its evidence coverage. Initial outcomes: `pass`, `fail`, `insufficient_evidence`, and `exception_authorized`. Preserve the original evaluation and any later re-evaluation separately.
+Run `miaudit --help` for the full list. Evidence and decision examples live in [crates/README.md](crates/README.md).
 
-Examples for a high-risk payments repository:
+## Team server
 
-- A production change requires authenticated requester and reviewer identities.
-- Changes to settlement logic require a separate domain reviewer and explicit decision acceptance.
-- Access to a restricted source requires a recorded authorization and approved access path.
-- Critical missing telemetry blocks release until evidence is reconciled or an authorized exception exists.
-- Approval must match the final reviewed revision; deployment must match the approved artifact digest.
-- Failed required checks prevent release; a summary saying “tests passed” is insufficient.
+```sh
+export MIAUDIT_MONGO_URI=mongodb://127.0.0.1:27017
+miaudit-server token create ci          # prints a push token once
+miaudit-server serve --port 7171
 
-miauDit publishes checks, but Git branch protection and deployment infrastructure enforce them. Policy changes and exceptions are themselves reviewed and audited. A green check means specified controls passed against available evidence, not that the code is secure or correct.
+# from any audited repository
+export MIAUDIT_SERVER=http://127.0.0.1:7171 MIAUDIT_TOKEN=...
+miaudit push
+miaudit remote audits owner/name --gap CAPTURE_UNAVAILABLE
+```
 
-## 14. Product experience
+The server stores every repository in one MongoDB database and re-hashes each blob, record, manifest and binding it receives, refusing anything that does not match its ID. Pushing needs a token; reading has no accounts yet, only an optional shared password (`MIAUDIT_SERVER_READ_PASSWORD`). Run it behind TLS.
 
-- **Organization overview:** repositories, pending reviews, evidence gaps, expiring exceptions and recent deployments.
-- **Repository page:** code-linked audit history, contributors and role assignments, policies and integration health.
-- **Commit dossier:** diff beside decisions, context, sources, agent graph, tool activity and approvals.
-- **Decision review:** accept, amend, reject or defer with explicit scope and supporting evidence.
-- **Data access view:** permission grants separated from observed resource access, with restricted payload controls.
-- **Release page:** source → dossier → review → build → artifact → environment, with broken links highlighted.
-- **Audit export:** bounded time/repository/release scope, signed manifest and independently verifiable evidence bundle.
+## What it proves, and what it does not
 
-The default view should explain the change in a few minutes. Raw events remain accessible to authorized investigators. Generated summaries are optional navigation aids and never replace original evidence.
+- Hashes show a record **has not changed** and links are consistent. They do not show who wrote it or that its content is true.
+- Context, decisions and evidence are the agent's own statements. A passing `verify` means the bytes are intact, not that the claims are correct.
+- Hook capture is **partial**: reads and network calls made inside shell commands are not seen, and the agent runs as the same user who owns `.miaudit/`, so a determined actor can rewrite the store. Nothing is signed yet.
+- Prompts are stored unencrypted in the local store. There is no redaction and no retention policy, so keep secrets out of prompts and evidence.
+- Nothing here is a statement about legal responsibility or regulatory compliance.
 
-## 15. MVP and later scope
+## Project layout
 
-**Discovery:** validate one client's actual capture surface, interview a fintech engineering/security team, classify data, and define the minimum acceptable release dossier and retention policy.
+| Path | What |
+|---|---|
+| `crates/miaudit-schema` | Types, canonical form, IDs, tree digests |
+| `crates/miaudit-cli` | The `miaudit` binary: store, hooks, commands, `push`, `remote`, `ui` |
+| `crates/miaudit-ui` | The read-only viewer as a library, and the JSON API shared with the server |
+| `crates/miaudit-server` | The team server (MongoDB) |
+| `crates/miaudit-web` | Embeds the built web app into the binaries |
+| `web/` | React + TypeScript interface (Vite, Vitest) |
+| `docs/` | Design documents |
+| `scripts/e2e.sh` | End-to-end run of the installed binaries |
 
-**MVP:** single-organization deployment with tenant-scoped records, one agent adapter, one Git integration, collector, event/artifact ingestion, commit dossiers, explicit human decisions, revision-bound approvals, basic policy checks, one CI/deployment integration, and signed audit exports. Include evidence gaps, redaction and access controls from the start.
+## Development
 
-**Next:** additional agent clients, managed MCP capture, multi-agent contribution graphs, stronger enterprise identity, legal holds, private installation tooling and more CI providers.
+```sh
+cargo test --workspace            # set MIAUDIT_TEST_MONGO_URI to include the server suites
+cd web && npm test && npm run build
+scripts/e2e.sh                    # uses the installed binaries; run `cargo install` first
+```
 
-**Later:** cross-repository incident analysis, reusable control mappings and organization-wide evidence queries.
+`cargo build` builds the web app when its sources changed (set `MIAUDIT_SKIP_WEB_BUILD=1` to skip it). This repository audits its own changes with miauDit; see [CLAUDE.md](CLAUDE.md) for the workflow it follows.
 
-Out of initial scope: replacing Git hosting, generating application code, autonomous remediation, employee productivity scoring, legal liability determination, universal visibility into arbitrary agents, and certification of regulatory compliance.
+## Documentation
 
-## 16. Validation criteria
+- [crates/README.md](crates/README.md): what is implemented, command details, trust model, server and web interface notes
+- [docs/product-proposal.md](docs/product-proposal.md): the original product and architecture proposal
+- [docs/cli-and-normalized-api.md](docs/cli-and-normalized-api.md): CLI and API contract
+- [docs/evidence-mcp-and-harness.md](docs/evidence-mcp-and-harness.md): evidence MCP and execution harness design
+- [docs/interaction-and-review-evidence.md](docs/interaction-and-review-evidence.md): prompts, responses and review evidence
 
-Before production use, demonstrate that:
+## Status
 
-1. A deployed artifact can be traced to the exact reviewed revision, dossier and responsible approvers.
-2. A subsequent code change cannot reuse an obsolete revision-bound approval.
-3. A missing collector interval appears as insufficient evidence under a policy requiring that capture.
-4. Altering a retained evidence artifact fails independent verification.
-5. A redacted secret never appears in uploaded payloads, derived summaries, indexes or exports in the tested capture paths.
-6. An unauthorized principal cannot retrieve another repository's or tenant's restricted evidence.
-7. Squashed and rebased changes preserve traceable relationships without overstating authorship.
-8. Offline retries do not duplicate records; gaps and delayed arrivals remain visible.
-9. Retention deletion removes eligible payloads and derived copies while preserving permitted tombstones and honoring holds.
-10. An emergency release leaves an explicit exception and required follow-up review.
+Early and in daily use on this repository. Working today: the local store, audit commits, hook capture, checkpoints attached to audits, superseded decisions, Git and PR links, the viewer, and the team server. Not built yet: signatures, human approval flow, policy checks, accounts and per-repository permissions, an MCP server and a trusted execution harness. Details are in [docs/product-proposal.md](docs/product-proposal.md).
 
-Pilot measures: time to reconstruct a release, proportion of releases with complete required provenance, unresolved gap rate, reviewer effort, collector overhead, evidence storage cost, and false policy-block rate. Set numerical targets with pilot customers.
+## License
 
-## 17. Decisions still open
-
-- Which client/version offers sufficient supported capture for the first adapter?
-- Does “Grok” mean a particular coding client, API-based agent, or another workflow?
-- Which Git host, CI platform and deployment environment should the first pilot support?
-- Which events require managed workstations or gateways for the desired assurance level?
-- Which jurisdictions, retention rules and customer data classifications apply?
-- Should the first deployment be customer-hosted only or also offer managed hosting?
-- Which actions require stronger authentication and separation of duties?
-- How much source and conversation content may leave a developer workstation?
-- Is an entirely Rust web stack required, or only the collector and backend?
-
-These questions guide discovery. They do not change the core model: observable evidence, explicit human decisions, and verified links from development activity to production.
+No license file has been added yet, so the code is not licensed for reuse. Choosing one is an open decision.

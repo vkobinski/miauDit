@@ -1,6 +1,6 @@
 # Prompts, responses, authorizations and review evidence
 
-Status: design only. Extends the [normalized API](cli-and-normalized-api.md) and [execution harness](evidence-mcp-and-harness.md). No implementation or UI is introduced.
+Status: design. Hook capture of prompts, replies, commands and reads is implemented in part (hash-only receipts; see [crates/README.md](../crates/README.md)); review-observation capture and approvals are not. Extends the [normalized API](cli-and-normalized-api.md) and [execution harness](evidence-mcp-and-harness.md). No implementation or UI is introduced.
 
 ## 1. Audit question
 

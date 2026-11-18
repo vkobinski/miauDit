@@ -1,6 +1,6 @@
 # CLI, audit commits and normalized API
 
-Status: design only. No CLI, API or UI is implemented. Extends the [product model](../README.md) and [MCP/harness contract](evidence-mcp-and-harness.md). The immediate delivery scope is Rust services, CLI and MCP, without a graphical interface. Earlier UI concepts remain possible later consumers.
+Status: design contract. Part of it is implemented (the local CLI, a JSON read API, a push endpoint and a viewer; see [crates/README.md](../crates/README.md)), and this document describes the intended whole, so command names and shapes here can differ from what exists. Extends the [product model](product-proposal.md) and [MCP/harness contract](evidence-mcp-and-harness.md). The immediate delivery scope is Rust services, CLI and MCP, without a graphical interface. Earlier UI concepts remain possible later consumers.
 
 ## 1. Shared interface
 
