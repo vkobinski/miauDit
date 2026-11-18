@@ -15,9 +15,13 @@ fn audit(dir: &Path, args: &[&str]) -> (i32, Value) {
 }
 
 fn hook(dir: &Path, sub: &str, input: &[u8]) -> (i32, String, String) {
+    hook_args(dir, &[sub], input)
+}
+
+fn hook_args(dir: &Path, args: &[&str], input: &[u8]) -> (i32, String, String) {
     let mut c = Command::new(env!("CARGO_BIN_EXE_miaudit"))
         .current_dir(dir)
-        .arg(sub)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -32,6 +36,12 @@ fn repo() -> TempDir {
     let d = tempfile::tempdir().unwrap();
     assert_eq!(audit(d.path(), &["init"]).0, 0);
     d
+}
+
+fn captured_as(d: &Path, agent: &str, v: Value) {
+    let (code, out, _) = hook_args(d, &["capture", "--agent", agent], v.to_string().as_bytes());
+    assert_eq!(code, 0);
+    assert_eq!(out, "", "capture must never print to stdout");
 }
 
 fn captured(d: &Path, v: Value) {
@@ -241,4 +251,84 @@ fn parallel_captures_keep_the_chain_intact() {
     let v = audit(&p, &["events"]).1;
     assert_eq!(v["result"]["chain"], "ok");
     assert_eq!(v["result"]["events_total"], 8);
+}
+
+fn codex_patch(d: &Path, tool: &str, command: &str) {
+    captured_as(d, "codex", json!({"hook_event_name": "PostToolUse", "session_id": "c1", "turn_id": "t1", "cwd": d, "model": "gpt", "tool_name": tool,
+        "tool_use_id": "u1", "tool_input": {"command": command}, "tool_response": {}}));
+}
+
+fn recent(d: &Path) -> Vec<Value> {
+    audit(d, &["events"]).1["result"]["recent"].as_array().unwrap().clone()
+}
+
+#[test]
+fn codex_apply_patch_yields_one_edit_event_per_file() {
+    let d = repo();
+    let p = d.path();
+    fs::write(p.join("new.txt"), "n").unwrap();
+    fs::write(p.join("upd.txt"), "u").unwrap();
+    fs::write(p.join("moved.txt"), "m").unwrap();
+    let patch = "*** Begin Patch\n*** Add File: new.txt\n+SECRET-BODY\n*** Update File: upd.txt\n@@\n-a\n+b\n*** Delete File: gone.txt\n*** Update File: old.txt\n*** Move to: moved.txt\n@@\n-x\n+y\n*** End Patch";
+    codex_patch(p, "apply_patch", patch);
+    let ev = recent(p);
+    let got: Vec<(String, String)> = ev.iter().map(|e| (e["data"]["path"].as_str().unwrap_or("").to_string(), e["data"]["operation"].as_str().unwrap_or("").to_string())).collect();
+    assert_eq!(got, vec![
+        ("new.txt".to_string(), "add".to_string()),
+        ("upd.txt".to_string(), "update".to_string()),
+        ("gone.txt".to_string(), "delete".to_string()),
+        ("old.txt".to_string(), "move_from".to_string()),
+        ("moved.txt".to_string(), "move_to".to_string()),
+    ]);
+    assert!(ev[0]["data"]["digest_after"].as_str().unwrap().starts_with("sha256:"));
+    assert!(ev[2]["data"]["digest_after"].is_null());
+    let text = log_text(p);
+    assert!(text.contains("codex_hook") && !text.contains("claude_code_hook"));
+    assert!(!text.contains("SECRET-BODY"), "patch bodies must not be stored");
+    assert_eq!(audit(p, &["events"]).1["result"]["chain"], "ok");
+}
+
+#[test]
+fn codex_edits_feed_the_same_gaps_and_stop_check() {
+    let d = repo();
+    let p = d.path();
+    fs::write(p.join("a.txt"), "1").unwrap();
+    fs::write(p.join("b.txt"), "2").unwrap();
+    codex_patch(p, "apply_patch", "*** Begin Patch\n*** Add File: a.txt\n+1\n*** End Patch");
+    assert_eq!(audit(p, &["add", "a.txt", "b.txt"]).0, 0);
+    assert_eq!(subjects(p, "STAGED_WITHOUT_OBSERVED_EDIT"), vec!["b.txt"]);
+    let (code, out, err) = hook(p, "stop-check", br#"{"hook_event_name":"Stop","turn_id":"t1","stop_hook_active":false}"#);
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(err.contains("a.txt"));
+    assert_eq!(hook(p, "stop-check", br#"{"hook_event_name":"Stop","stop_hook_active":true}"#).0, 0);
+}
+
+#[test]
+fn codex_bash_with_inline_patch_records_command_and_files() {
+    let d = repo();
+    let p = d.path();
+    fs::write(p.join("c.txt"), "c").unwrap();
+    codex_patch(p, "Bash", "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: c.txt\n+c\n*** End Patch\nEOF");
+    let kinds: Vec<String> = recent(p).iter().map(|e| e["kind"].as_str().unwrap().to_string()).collect();
+    assert_eq!(kinds, vec!["command", "file_edit"]);
+    assert_eq!(recent(p)[0]["data"]["program"], "apply_patch");
+}
+
+#[test]
+fn codex_unparsed_patch_and_prompt_are_recorded() {
+    let d = repo();
+    let p = d.path();
+    codex_patch(p, "apply_patch", "not a patch");
+    captured_as(p, "codex", json!({"hook_event_name": "UserPromptSubmit", "turn_id": "t1", "cwd": p, "prompt": "hello codex"}));
+    let ev = recent(p);
+    assert_eq!(ev[0]["kind"], "tool_call");
+    assert_eq!(ev[0]["data"]["unparsed_patch"], true);
+    assert_eq!(ev[1]["kind"], "user_prompt");
+}
+
+#[test]
+fn unknown_agent_is_rejected_by_the_cli() {
+    let d = repo();
+    let (code, _, _) = hook_args(d.path(), &["capture", "--agent", "other"], b"{}");
+    assert_eq!(code, 2);
 }
