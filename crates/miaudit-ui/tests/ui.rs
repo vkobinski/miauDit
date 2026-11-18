@@ -277,3 +277,27 @@ async fn screenshot_evidence_is_listed_and_only_real_images_are_served() {
     let (s, _, _) = get(&app, "GET", &format!("/{slug}/api/audits/{id}/evidence/{e1}/image"), "evil.example").await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn pull_request_bindings_are_exposed_on_list_and_detail() {
+    use std::os::unix::fs::PermissionsExt;
+    let (d, id) = fixture();
+    let sha = git(d.path(), &["rev-parse", "HEAD"]);
+    let gh = tempfile::tempdir().unwrap();
+    let script = gh.path().join("gh");
+    fs::write(&script, format!("#!/bin/sh\necho '{{\"number\":7,\"url\":\"https://github.com/acme/repo/pull/7\",\"headRefOid\":\"{sha}\",\"state\":\"OPEN\"}}'\n")).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = audit_bin();
+    let out = Command::new(&bin).env("PATH", format!("{}:/usr/bin:/bin", gh.path().display())).env("MIAUDIT_GITHUB_USER", "test-user").current_dir(d.path()).args(["--json", "bind", &id, "--pr", "7"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+
+    let app = app(&d);
+    let slug = slug(&d);
+    let list = json(&get(&app, "GET", &format!("/{slug}/api/audits"), HOST).await.2);
+    let pr = list["audits"][0]["git"].as_array().unwrap().iter().find(|g| !g["pull_request"].is_null()).expect("the PR binding is listed");
+    assert_eq!((pr["pull_request"]["number"].as_u64(), pr["pull_request"]["web_url"].as_str()), (Some(7), Some("https://github.com/acme/repo/pull/7")));
+    assert_eq!(pr["commit"], sha.as_str());
+    let detail = json(&get(&app, "GET", &format!("/{slug}/api/audits/{id}/detail"), HOST).await.2);
+    let with_pr = detail["bindings"].as_array().unwrap().iter().find(|b| !b["body"]["pull_request"].is_null()).expect("the PR binding is in the detail");
+    assert_eq!((with_pr["body"]["pull_request"]["state"].as_str(), with_pr["body"]["pull_request"]["head_commit"].as_str()), (Some("OPEN"), Some(sha.as_str())));
+}

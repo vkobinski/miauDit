@@ -59,19 +59,43 @@ impl Ctx {
     }
 }
 
-pub fn init(cwd: &Path) -> Res<Out> {
+fn hooks_report(plan: &Option<crate::claude_hooks::Plan>) -> Value {
+    match plan {
+        None => json!({"installed": false, "reason": "skipped with --no-hooks"}),
+        Some(p) => json!({
+            "installed": true,
+            "agent": "claude-code",
+            "settings_path": p.path,
+            "created_file": p.created_file && !p.added.is_empty(),
+            "added": p.added,
+            "already_present": p.already_present,
+            "warning": crate::claude_hooks::binary_warning(),
+            "note": "Claude Code reads hook settings when a session starts; in a session that is already open, review them in /hooks or restart it",
+        }),
+    }
+}
+
+pub fn init(cwd: &Path, hooks: bool, local: bool) -> Res<Out> {
     let cwd = cwd.canonicalize()?;
     if let Ok(s) = Store::discover(&cwd) {
         let c = s.config()?;
-        return ok(json!({"already_initialized": true, "repo_id": c.repo_id, "root": s.root}));
+        let plan = if hooks { Some(crate::claude_hooks::plan(&s.root, local)?) } else { None };
+        if let Some(p) = &plan {
+            p.apply()?;
+        }
+        return ok(json!({"already_initialized": true, "repo_id": c.repo_id, "root": s.root, "hooks": hooks_report(&plan)}));
     }
+    let plan = if hooks { Some(crate::claude_hooks::plan(&cwd, local)?) } else { None };
     let probe = cwd.join(".audit-case-probe-x");
     let case_sensitive = fs::write(&probe, b"").ok().map(|_| !cwd.join(".AUDIT-CASE-PROBE-X").exists());
     let _ = fs::remove_file(&probe);
     let config = Config { schema_version: SCHEMA_VERSION.into(), repo_id: format!("repo_{}", uuid::Uuid::new_v4().simple()), created_at: now(), case_sensitive };
     let s = Store::init(&cwd, &config)?;
     project::init(&s)?;
-    ok(json!({"already_initialized": false, "repo_id": config.repo_id, "root": s.root, "case_sensitive": case_sensitive}))
+    if let Some(p) = &plan {
+        p.apply()?;
+    }
+    ok(json!({"already_initialized": false, "repo_id": config.repo_id, "root": s.root, "case_sensitive": case_sensitive, "hooks": hooks_report(&plan)}))
 }
 
 fn now() -> String {
@@ -284,6 +308,22 @@ fn partial_note(name: &str, s: &events::Summary) -> Option<String> {
     }
 }
 
+fn unavailable_gap_message(cap: &str, obs: &Observed) -> String {
+    if let Some(e) = &obs.chain_error {
+        return format!("not recorded: the hook event log failed its integrity check ({e}), so none of its events were used; see EVENT_CHAIN_BROKEN");
+    }
+    if obs.events.is_empty() {
+        return "not recorded: no hook events exist since the last audit commit; the Claude Code or Codex hooks are not installed in this repository or did not fire (check `miaudit events` and the hooks in .claude/settings.json)".into();
+    }
+    let needs = match cap {
+        "conversation_capture" => "user prompts or assistant replies",
+        "agent_topology" => "sessions or subagent events",
+        "resource_access_receipts" => "Read, Grep, Glob, Web or MCP calls",
+        _ => "shell commands",
+    };
+    format!("not recorded: {} hook event(s) were captured since the last audit commit, but none of the kind this needs ({needs})", obs.events.len())
+}
+
 fn coverage(obs: &Observed) -> Vec<Capability> {
     let mut c = vec![Capability { capability: "file_snapshot".into(), provenance: Provenance::SelfReported, note: Some("captured by the local CLI, not a trusted harness".into()) }];
     let trusted = obs.chain_error.is_none();
@@ -462,7 +502,7 @@ fn compute_gaps(ctx: &Ctx, p: &Pending, git: &GitBaseline) -> Res<Vec<Gap>> {
     for cap in UNAVAILABLE_CAPABILITIES {
         match partial_note(cap, &obs_now.summary).filter(|_| obs_now.chain_error.is_none()) {
             Some(note) => g.push(gap(&format!("CAPTURE_PARTIAL:{cap}"), &note, vec![cap.into()])),
-            None => g.push(gap(&format!("CAPTURE_UNAVAILABLE:{cap}"), "capture capability not available in this slice", vec![cap.into()])),
+            None => g.push(gap(&format!("CAPTURE_UNAVAILABLE:{cap}"), &unavailable_gap_message(cap, &obs_now), vec![cap.into()])),
         }
     }
     g.push(gap("NO_HUMAN_APPROVAL", "no human disposition recorded; approvals are separate attestations", vec![]));
@@ -724,14 +764,25 @@ pub fn verify(ctx: &Ctx, id: &str) -> Res<Out> {
     finish(id, checks, worst)
 }
 
-pub fn bind(ctx: &Ctx, audit_id: &str, rev: &str, assert: bool) -> Res<Out> {
-    bind_inner(ctx, audit_id, rev, assert, true)
+pub fn bind(ctx: &Ctx, audit_id: &str, rev: Option<&str>, pr: Option<&str>, assert: bool) -> Res<Out> {
+    match (rev, pr) {
+        (Some(rev), None) => bind_inner(ctx, audit_id, rev, None, assert, true),
+        (None, Some(pr)) => {
+            let found = crate::pr::resolve(&ctx.store.root, pr)?;
+            let head = found.head_commit.clone();
+            bind_inner(ctx, audit_id, &head, Some(found), assert, true)
+        }
+        _ => Err(CliError::validation("BIND_TARGET", "pass exactly one of --git-commit or --pr")),
+    }
 }
 
-fn bind_inner(ctx: &Ctx, audit_id: &str, rev: &str, assert: bool, record: bool) -> Res<Out> {
+fn bind_inner(ctx: &Ctx, audit_id: &str, rev: &str, pr: Option<PullRequestRef>, assert: bool, record: bool) -> Res<Out> {
     let m = ctx.store.get_commit(audit_id)?.ok_or_else(|| CliError::validation("OBJECT_NOT_FOUND", format!("{audit_id} not found")))?;
     let root = &ctx.store.root;
-    let (commit, algorithm) = git::resolve_commit(root, rev)?;
+    let (commit, algorithm) = git::resolve_commit(root, rev).map_err(|e| match &pr {
+        Some(p) if e.code == "GIT_COMMIT_NOT_FOUND" => CliError::validation("PR_HEAD_NOT_LOCAL", format!("the head commit {} of pull request #{} is not in this repository; fetch it with `git fetch origin pull/{}/head`", p.head_commit, p.number, p.number)),
+        _ => e,
+    })?;
     let mut paths = Vec::new();
     for ch in &m.snapshot.changes {
         paths.push(PathCheck { path: ch.path.clone(), operation: ch.operation, state: git::check(root, &commit, ch)? });
@@ -759,13 +810,14 @@ fn bind_inner(ctx: &Ctx, audit_id: &str, rev: &str, assert: bool, record: bool) 
         verification: "local_git_inspection_unsigned".into(),
         provenance: if correspondence == Correspondence::Asserted { Provenance::SelfReported } else { Provenance::Derived },
         paths,
+        pull_request: pr,
     };
     let binding_id = body.binding_id()?;
     let stored = StoredBinding { binding_id: binding_id.clone(), body, created: Created { at: now(), clock_authority: "local_device_unverified".into() } };
     let created = if record { ctx.store.put_binding(&binding_id, &serde_json::to_vec_pretty(&stored)?)? } else { false };
     ok(json!({
         "binding_id": binding_id, "audit_id": audit_id, "duplicate": !created,
-        "git_commit": stored.body.git.commit, "commit_web_url": stored.body.git.commit_web_url,
+        "git_commit": stored.body.git.commit, "commit_web_url": stored.body.git.commit_web_url, "pull_request": stored.body.pull_request,
         "correspondence": correspondence, "paths_matched": matched, "paths_total": stored.body.paths.len(),
         "paths": stored.body.paths,
         "note": "web link is derived from the origin remote; it does not prove the commit was pushed",
@@ -787,9 +839,9 @@ pub fn bind_pending(ctx: &Ctx, rev: &str) -> Res<Out> {
         if bound.contains(&id) {
             continue;
         }
-        match bind_inner(ctx, &id, rev, false, false) {
+        match bind_inner(ctx, &id, rev, None, false, false) {
             Ok(Out { value, .. }) if value["correspondence"] == "full" => {
-                let done = bind_inner(ctx, &id, rev, false, true)?;
+                let done = bind_inner(ctx, &id, rev, None, false, true)?;
                 linked.push(json!({"audit_id": id, "correspondence": "full", "binding_id": done.value["binding_id"]}));
             }
             Ok(Out { value, .. }) => skipped.push(json!({"audit_id": id, "reason": format!("correspondence is {}; only full matches are linked automatically", value["correspondence"].as_str().unwrap_or("unknown"))})),

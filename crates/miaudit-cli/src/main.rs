@@ -1,8 +1,10 @@
+mod claude_hooks;
 mod commands;
 mod error;
 mod events;
 mod git;
 mod github;
+mod pr;
 mod project;
 mod push;
 mod remote;
@@ -26,7 +28,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    Init,
+    Init {
+        #[arg(long)]
+        no_hooks: bool,
+        #[arg(long)]
+        local: bool,
+    },
     Status,
     Add { paths: Vec<String> },
     Diff {
@@ -42,10 +49,13 @@ enum Cmd {
         message: String,
     },
     Log,
+    #[command(group = clap::ArgGroup::new("target").required(true).multiple(false).args(["git_commit", "pr"]))]
     Bind {
         audit_id: String,
         #[arg(long = "git-commit")]
-        git_commit: String,
+        git_commit: Option<String>,
+        #[arg(long)]
+        pr: Option<String>,
         #[arg(long)]
         assert: bool,
     },
@@ -124,8 +134,8 @@ enum AddOp {
 
 fn run(cli: &Cli) -> error::Res<Out> {
     let cwd = std::env::current_dir()?;
-    if let Cmd::Init = cli.cmd {
-        return commands::init(&cwd);
+    if let Cmd::Init { no_hooks, local } = &cli.cmd {
+        return commands::init(&cwd, !*no_hooks, *local);
     }
     if let Cmd::Remote { server, op } = &cli.cmd {
         let r = remote::Remote::new(server.as_deref())?;
@@ -137,7 +147,7 @@ fn run(cli: &Cli) -> error::Res<Out> {
     }
     let ctx = Ctx::open(&cwd)?;
     match &cli.cmd {
-        Cmd::Init => unreachable!(),
+        Cmd::Init { .. } => unreachable!(),
         Cmd::Status => commands::status(&ctx),
         Cmd::Add { paths } => commands::add(&ctx, paths),
         Cmd::Diff { staged } => commands::diff(&ctx, *staged),
@@ -147,7 +157,7 @@ fn run(cli: &Cli) -> error::Res<Out> {
         Cmd::Gaps => commands::gaps(&ctx),
         Cmd::Commit { message } => commands::commit(&ctx, message),
         Cmd::Log => commands::log(&ctx),
-        Cmd::Bind { audit_id, git_commit, assert } => commands::bind(&ctx, audit_id, git_commit, *assert),
+        Cmd::Bind { audit_id, git_commit, pr, assert } => commands::bind(&ctx, audit_id, git_commit.as_deref(), pr.as_deref(), *assert),
         Cmd::BindPending { git_commit } => commands::bind_pending(&ctx, git_commit),
         Cmd::GitHook { op: GitHookOp::Install } => commands::git_hook_install(&ctx),
         Cmd::Bindings { audit_id } => commands::bindings(&ctx, audit_id.as_deref()),

@@ -273,6 +273,15 @@ pub struct GitRef {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
+pub struct PullRequestRef {
+    pub number: u64,
+    pub web_url: String,
+    pub head_commit: String,
+    pub state: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct GitBindingBody {
     pub schema_version: String,
     pub kind: String,
@@ -282,6 +291,8 @@ pub struct GitBindingBody {
     pub verification: String,
     pub provenance: Provenance,
     pub paths: Vec<PathCheck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequestRef>,
 }
 
 impl GitBindingBody {
@@ -358,12 +369,37 @@ mod tests {
             verification: "local_git_inspection_unsigned".into(),
             provenance: Provenance::Derived,
             paths: vec![],
+            pull_request: None,
         };
         let a = body(Correspondence::Full, "abc").binding_id().unwrap();
         assert_eq!(a, body(Correspondence::Full, "abc").binding_id().unwrap());
         assert!(a.starts_with("bind_"));
         assert_ne!(a, body(Correspondence::Partial, "abc").binding_id().unwrap());
         assert_ne!(a, body(Correspondence::Full, "abd").binding_id().unwrap());
+    }
+
+    #[test]
+    fn pull_request_is_part_of_the_binding_id_only_when_present() {
+        let base = GitBindingBody {
+            schema_version: "1".into(),
+            kind: "git_binding".into(),
+            audit_id: "audit_x".into(),
+            git: GitRef { commit: "abc".into(), algorithm: "sha1".into(), repository_web_url: None, commit_web_url: None },
+            correspondence: Correspondence::Full,
+            verification: "local_git_inspection_unsigned".into(),
+            provenance: Provenance::Derived,
+            paths: vec![],
+            pull_request: None,
+        };
+        let text = serde_json::to_string(&base).unwrap();
+        assert!(!text.contains("pull_request"), "an absent pull request must not change the serialized form: {text}");
+        let mut with_pr = base.clone();
+        with_pr.pull_request = Some(PullRequestRef { number: 7, web_url: "https://github.com/a/b/pull/7".into(), head_commit: "abc".into(), state: "OPEN".into() });
+        assert_ne!(base.binding_id().unwrap(), with_pr.binding_id().unwrap());
+        let round: GitBindingBody = serde_json::from_slice(&serde_json::to_vec(&with_pr).unwrap()).unwrap();
+        assert_eq!(round, with_pr);
+        let old: GitBindingBody = serde_json::from_str(&text).unwrap();
+        assert_eq!(old.pull_request, None);
     }
 
     #[test]

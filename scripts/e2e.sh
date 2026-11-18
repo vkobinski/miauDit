@@ -29,6 +29,9 @@ echo "workdir: $W"
 git init -q . && git config user.name e2e && git config user.email e2e@example.invalid && git config commit.gpgsign false
 $M init --json >/dev/null; eq "init exits 0" $? 0
 [ "$(cat .miaudit/.gitignore)" = "*" ]; check "store ignores itself" $?
+[ -f .claude/settings.json ]; check "init links the Claude hooks in .claude/settings.json" $?
+grep -q "miaudit capture" .claude/settings.json; check "linked hooks include capture" $?
+HB=$(shasum -a 256 .claude/settings.json); $M init --json >/dev/null; [ "$HB" = "$(shasum -a 256 .claude/settings.json)" ]; check "a second init leaves the settings file untouched" $?
 [ ! -e .audit ]; check "no legacy .audit directory" $?
 [ -f .miaudit/PROJECT.md ]; check "init creates the project profile template" $?
 $M project check --json > pc.out; eq "incomplete profile exits 4" $? 4
