@@ -2,6 +2,7 @@
 set -u
 M="${MIAUDIT_BIN:-$HOME/.cargo/bin/miaudit}"
 UI="${MIAUDIT_UI_BIN:-$HOME/.cargo/bin/miaudit-ui}"
+SRV="${MIAUDIT_SERVER_BIN:-$HOME/.cargo/bin/miaudit-server}"
 pass=0
 fail=0
 check() {
@@ -18,8 +19,9 @@ print('' if d is None else d)" "$1"
 }
 
 W=$(mktemp -d)
-trap '[ -n "$UIPID" ] && { kill $UIPID 2>/dev/null; wait $UIPID 2>/dev/null; }; rm -rf "$W"' EXIT
+trap '[ -n "$UIPID" ] && { kill $UIPID 2>/dev/null; wait $UIPID 2>/dev/null; }; [ -n "$SRVPID" ] && { kill $SRVPID 2>/dev/null; wait $SRVPID 2>/dev/null; }; rm -rf "$W"' EXIT
 UIPID=
+SRVPID=
 cd "$W" || exit 2
 echo "binary: $M sha256=$(shasum -a 256 "$M" | cut -c1-16) ui=$(shasum -a 256 "$UI" | cut -c1-16)"
 echo "workdir: $W"
@@ -184,6 +186,55 @@ code=$(curl -s -o img.out -w '%{http_code}:%{content_type}' "http://127.0.0.1:$P
 eq "viewer serves the screenshot as image/png" "$code" "200:image/png"
 cmp -s img.out shot.png; check "served screenshot is byte-identical to the attached file" $?
 curl -s "http://127.0.0.1:$PORT/audit/$AID2" | grep -q "<img"; check "viewer page embeds the screenshot" $?
+
+if [ -n "${MIAUDIT_TEST_MONGO_URI:-}" ] && [ -x "$SRV" ]; then
+  SPORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])")
+  SDB="miaudit_e2e_$$_$RANDOM"
+  export MIAUDIT_MONGO_URI="$MIAUDIT_TEST_MONGO_URI" MIAUDIT_MONGO_DB="$SDB"
+  TOKEN=$($SRV token create e2e 2>/dev/null); eq "server creates a push token" $? 0
+  case "$TOKEN" in mdt_*) check "token has the mdt_ prefix" 0;; *) check "token has the mdt_ prefix" 1;; esac
+  $SRV serve --port "$SPORT" > server.log 2>&1 &
+  SRVPID=$!
+  for i in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$SPORT/healthz" && break; sleep 0.1; done
+  MIAUDIT_SERVER="http://127.0.0.1:$SPORT" MIAUDIT_TOKEN="wrong" $M push --json > push-bad.out; eq "push with a wrong token exits 2" $? 2
+  eq "wrong token is reported as PUSH_UNAUTHORIZED" "$(jget error.code < push-bad.out)" PUSH_UNAUTHORIZED
+  MIAUDIT_SERVER="http://127.0.0.1:$SPORT" MIAUDIT_TOKEN="$TOKEN" $M push --json > push1.out; eq "push exits 0" $? 0
+  OFFERED=$(jget result.offered.commits < push1.out)
+  eq "first push sends every audit commit" "$(jget result.sent.commits < push1.out)" "$OFFERED"
+  MIAUDIT_SERVER="http://127.0.0.1:$SPORT" MIAUDIT_TOKEN="$TOKEN" $M push --json > push2.out; eq "second push exits 0" $? 0
+  eq "second push sends no commits" "$(jget result.sent.commits < push2.out)" 0
+  eq "second push sends no blobs" "$(jget result.sent.blobs < push2.out)" 0
+  SLUG=$(jget result.repo < push1.out)
+  curl -s "http://127.0.0.1:$SPORT/api/v1/repos" > repos.out
+  eq "server lists the repo with its audit count" "$(jget repos.0.audits < repos.out)" "$OFFERED"
+  eq "server lists the pushed slug" "$(jget repos.0.slug < repos.out)" "$SLUG"
+  curl -s "http://127.0.0.1:$SPORT/" | grep -q "/$SLUG"; check "repo list page links the repo" $?
+  curl -s "http://127.0.0.1:$SPORT/$SLUG" | grep -q "frontend change"; check "repo page lists the audit commits" $?
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SPORT/$SLUG/audit/$AID2")
+  eq "audit page opens under the repo" "$code" 200
+  curl -s "http://127.0.0.1:$SPORT/$SLUG/audit/$AID2" | grep -q "integrity: pass"; check "server-side integrity check passes" $?
+  code=$(curl -s -o img2.out -w '%{http_code}:%{content_type}' "http://127.0.0.1:$SPORT/$SLUG/audit/$AID2/evidence/$EID/image")
+  eq "server serves the screenshot as image/png" "$code" "200:image/png"
+  cmp -s img2.out shot.png; check "server screenshot is byte-identical to the attached file" $?
+  curl -s "http://127.0.0.1:$SPORT/$SLUG/api/audits/$AID2" > raw.out
+  cmp -s raw.out ".miaudit/commits/$AID2.json"; check "server returns the exact manifest bytes" $?
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data '{"x":1}' "http://127.0.0.1:$SPORT/api/v1/repos/$(jget result.repo_id < push1.out)/commits/audit_$(printf '0%.0s' $(seq 1 64))")
+  eq "server refuses a commit whose content does not hash to its id" "$code" 422
+  $M remote --server "http://127.0.0.1:$SPORT" repos --json > qrepos.out; eq "remote repos exits 0" $? 0
+  eq "remote repos lists the pushed slug" "$(jget result.repos.0.slug < qrepos.out)" "$SLUG"
+  $M remote --server "http://127.0.0.1:$SPORT" audits "$SLUG" --gap NO_HUMAN_APPROVAL --json > qaudits.out; eq "remote audits exits 0" $? 0
+  eq "every audit has the no-human-approval gap" "$(jget result.total < qaudits.out)" "$OFFERED"
+  $M remote --server "http://127.0.0.1:$SPORT" audits "$SLUG" --gap NO_SUCH_GAP_CODE --json > qnone.out
+  eq "an unmatched gap filter returns nothing" "$(jget result.total < qnone.out)" 0
+  $M remote --server "http://127.0.0.1:$SPORT" audits "$SLUG" | grep -q "audit commit(s) match in $SLUG"; check "remote audits prints a readable table without --json" $?
+  $M remote --server "http://127.0.0.1:$SPORT" show "$SLUG" "$AID2" --json > qshow.out; eq "remote show exits 0" $? 0
+  eq "remote show returns the manifest description" "$(jget result.manifest.description < qshow.out)" "frontend change"
+  $SRV token revoke e2e >/dev/null 2>&1
+  MIAUDIT_SERVER="http://127.0.0.1:$SPORT" MIAUDIT_TOKEN="$TOKEN" $M push --json > push3.out; eq "revoked token cannot push (exit 2)" $? 2
+  unset MIAUDIT_MONGO_URI MIAUDIT_MONGO_DB
+else
+  echo "SKIP: server section (set MIAUDIT_TEST_MONGO_URI and install miaudit-server to run it)"
+fi
 
 echo "e2e: $pass passed, $fail failed"
 [ "$fail" = "0" ]

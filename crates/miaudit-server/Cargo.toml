@@ -1,0 +1,32 @@
+[package]
+name = "miaudit-server"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "miaudit-server"
+path = "src/main.rs"
+
+[lib]
+name = "miaudit_server"
+path = "src/lib.rs"
+
+[dependencies]
+miaudit-schema = { path = "../miaudit-schema" }
+miaudit-ui = { path = "../miaudit-ui" }
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+mongodb = "3"
+futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+ureq = { version = "2", features = ["json"] }
+tower = "0.5"
+http-body-util = "0.1"

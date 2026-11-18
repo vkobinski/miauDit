@@ -17,7 +17,7 @@ pub fn esc(s: &str) -> String {
     o
 }
 
-fn short(id: &str) -> String {
+pub fn short(id: &str) -> String {
     let (head, rest) = id.split_once('_').unwrap_or(("", id));
     format!("{}{}…", if head.is_empty() { String::new() } else { format!("{head}_") }, esc(&rest.chars().take(10).collect::<String>()))
 }
@@ -31,7 +31,7 @@ fn github_link(url: &str, label: &str) -> String {
     }
 }
 
-const CSS: &str = r#"
+pub const CSS: &str = r#"
 :root{--bg:#f6f7f9;--card:#fff;--fg:#14181f;--mut:#5b6573;--line:#e2e6ec;--accent:#2457d6;--ok:#157347;--okbg:#e3f4ea;--warn:#8a5a00;--warnbg:#fff1d6;--bad:#b3261e;--badbg:#fde7e5;--neu:#46505e;--neubg:#eceff3}
 @media(prefers-color-scheme:dark){:root{--bg:#0f1318;--card:#171c23;--fg:#e8ecf2;--mut:#98a3b3;--line:#2a323d;--accent:#7aa2ff;--ok:#6fd49a;--okbg:#14301f;--warn:#f0c060;--warnbg:#3a2d10;--bad:#ff8f86;--badbg:#401a18;--neu:#b4becc;--neubg:#232a34}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
@@ -56,7 +56,7 @@ ul{margin:4px 0;padding-left:20px}.crumb{font-size:13px;margin-bottom:12px}
 @media(max-width:560px){.kv{grid-template-columns:1fr}}
 "#;
 
-fn shell(title: &str, body: &str) -> String {
+pub fn shell(title: &str, body: &str) -> String {
     format!(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{}</title><style>{CSS}</style></head><body><main>{body}</main></body></html>"#, esc(title))
 }
 
@@ -64,7 +64,7 @@ pub fn message(title: &str, text: &str) -> String {
     shell(title, &format!(r#"<div class="crumb"><a href="/">← miauDit</a></div><div class="card"><h2>{}</h2><p>{}</p></div>"#, esc(title), esc(text)))
 }
 
-fn prov(p: Provenance) -> String {
+pub fn prov(p: Provenance) -> String {
     let (cls, label) = match p {
         Provenance::Observed => ("b-ok", "observed"),
         Provenance::SelfReported => ("b-warn", "self-reported"),
@@ -85,7 +85,7 @@ fn corr(c: Correspondence) -> String {
     format!(r#"<span class="badge {cls}">{label}</span>"#)
 }
 
-fn git_cell(b: &miaudit_schema::model::StoredBinding) -> String {
+pub fn git_cell(b: &miaudit_schema::model::StoredBinding) -> String {
     let sha: String = b.body.git.commit.chars().take(10).collect();
     let link = match &b.body.git.commit_web_url {
         Some(u) => github_link(u, &sha),
@@ -118,7 +118,7 @@ pub fn index(repo: &Repo, port: u16) -> String {
         esc(&repo.root.display().to_string())))
 }
 
-fn author_cell(a: Option<&miaudit_schema::model::Author>) -> String {
+pub fn author_cell(a: Option<&miaudit_schema::model::Author>) -> String {
     match a {
         None => r#"<span class="muted">not recorded (older audit commit)</span>"#.to_string(),
         Some(a) => match &a.github_login {
@@ -138,6 +138,11 @@ fn list(items: &[String]) -> String {
 }
 
 pub fn detail(v: &View, ver: &Verification) -> String {
+    shell(&format!("{} · miauDit", v.manifest.description), &detail_body(v, ver, "", r#"<a href="/">← all audit commits</a>"#))
+}
+
+pub fn detail_body(v: &View, ver: &Verification, base: &str, crumb: &str) -> String {
+    let base = esc(base);
     let m = &v.manifest;
     let (int_cls, int_label) = match ver {
         Verification::Result { integrity, .. } => match integrity.as_str() {
@@ -154,11 +159,11 @@ pub fn detail(v: &View, ver: &Verification) -> String {
 <div class="stat"><div class="k">Human approval</div><div class="v"><span class="badge b-bad">none recorded</span></div></div></div>"#, esc(&int_label));
 
     let parents = if m.parents.is_empty() { r#"<span class="muted">none (root)</span>"#.to_string() } else {
-        m.parents.iter().map(|p| format!(r#"<a class="mono" href="/audit/{}">{}</a>"#, esc(p), esc(p))).collect::<Vec<_>>().join("<br>")
+        m.parents.iter().map(|p| format!(r#"<a class="mono" href="{base}/audit/{}">{}</a>"#, esc(p), esc(p))).collect::<Vec<_>>().join("<br>")
     };
     let meta = format!(r#"<div class="card"><h2>{}</h2><div class="kv">{}{}{}{}{}{}</div></div>"#,
         esc(&m.description),
-        kv("Audit ID", &format!(r#"<span class="mono">{}</span> · <a href="/api/audits/{id}">raw manifest</a>"#, esc(&v.id), id = esc(&v.id))),
+        kv("Audit ID", &format!(r#"<span class="mono">{}</span> · <a href="{base}/api/audits/{id}">raw manifest</a>"#, esc(&v.id), id = esc(&v.id))),
         kv("Created", &format!("{} <span class=\"muted\">({})</span>", esc(&m.created.at), esc(&m.created.clock_authority))),
         kv("GitHub user", &author_cell(m.author.as_ref())),
         kv("Parents", &parents),
@@ -240,7 +245,7 @@ pub fn detail(v: &View, ver: &Verification) -> String {
             kv("Artifact", &format!(r#"<span class="mono">{}</span> · {} bytes"#, esc(&o.body.artifact.digest), o.body.artifact.size))
                 + &kv("Phase / environment", &format!("{} {}", o.body.phase.map(|p| format!(r#"<span class="badge b-neu">{p:?}</span>"#)).unwrap_or_else(|| r#"<span class="muted">not declared</span>"#.into()), o.body.environment.map(|p| format!(r#"<span class="badge b-neu">{p:?}</span>"#)).unwrap_or_default())),
             kv("Availability", &esc(e.artifact_state)),
-            if e.image { format!(r#"<img class="shot" src="/audit/{}/evidence/{}/image" alt="evidence image">"#, esc(&v.id), esc(&e.id)) } else { e.preview.as_deref().map(|p| format!("<pre>{}</pre>", esc(p))).unwrap_or_default() }),
+            if e.image { format!(r#"<img class="shot" src="{base}/audit/{}/evidence/{}/image" alt="evidence image">"#, esc(&v.id), esc(&e.id)) } else { e.preview.as_deref().map(|p| format!("<pre>{}</pre>", esc(p))).unwrap_or_default() }),
         None => format!(r#"<div class="item"><span class="mono">{}</span> <span class="badge b-bad">object unavailable</span></div>"#, esc(&e.id)),
     }).collect();
 
@@ -262,12 +267,12 @@ pub fn detail(v: &View, ver: &Verification) -> String {
         }
     };
 
-    shell(&format!("{} · miauDit", m.description), &format!(
-        r#"<div class="crumb"><a href="/">← all audit commits</a></div>{meta}{stats}<div style="height:16px"></div>{git}{snapshot}{}{}{}{capture}{verification}"#,
+    format!(
+        r#"<div class="crumb">{crumb}</div>{meta}{stats}<div style="height:16px"></div>{git}{snapshot}{}{}{}{capture}{verification}"#,
         section("Context", contexts, "No context recorded."),
         section("Decisions", decisions, "No decisions recorded."),
         section("Evidence", evidence, "No evidence attached."),
-    ))
+    )
 }
 
 fn op(o: Operation) -> &'static str {
