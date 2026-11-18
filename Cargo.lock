@@ -1274,9 +1274,11 @@ dependencies = [
  "chrono",
  "clap",
  "miaudit-schema",
+ "miaudit-ui",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "ureq",
  "uuid",
 ]
@@ -1320,7 +1322,6 @@ name = "miaudit-ui"
 version = "0.1.0"
 dependencies = [
  "axum",
- "clap",
  "http-body-util",
  "miaudit-schema",
  "miaudit-web",

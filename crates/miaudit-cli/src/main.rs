@@ -10,6 +10,7 @@ mod push;
 mod remote;
 mod snapshot;
 mod store;
+mod ui_cmd;
 
 use clap::{Parser, Subcommand};
 use commands::{Ctx, Out};
@@ -84,6 +85,12 @@ enum Cmd {
         server: Option<String>,
         #[arg(long)]
         name: Option<String>,
+    },
+    Ui {
+        #[arg(long)]
+        repo: Option<std::path::PathBuf>,
+        #[arg(long, default_value_t = 7070)]
+        port: u16,
     },
     Remote {
         #[arg(long, global = true)]
@@ -169,7 +176,7 @@ fn run(cli: &Cli) -> error::Res<Out> {
         Cmd::Show { id } => commands::show(&ctx, id),
         Cmd::Verify { id } => commands::verify(&ctx, id),
         Cmd::Push { server, name } => push::push(&ctx, server.as_deref(), name.as_deref()),
-        Cmd::Remote { .. } => unreachable!(),
+        Cmd::Remote { .. } | Cmd::Ui { .. } => unreachable!(),
     }
 }
 
@@ -262,20 +269,39 @@ fn main() {
     if matches!(cli.cmd, Cmd::Capture { .. } | Cmd::StopCheck { .. } | Cmd::SessionStart) {
         run_hook(&cli.cmd);
     }
+    if matches!(cli.cmd, Cmd::Ui { .. }) {
+        run_ui(&cli);
+    }
     let (envelope, exit) = match run(&cli) {
         Ok(Out { value, exit }) => (json!({"contract_version": CONTRACT_VERSION, "ok": exit == 0, "result": value}), exit),
         Err(e) => (json!({"contract_version": CONTRACT_VERSION, "ok": false, "error": e.to_json()}), e.exit),
     };
+    print_envelope(&cli, &envelope);
+    std::process::exit(exit);
+}
+
+fn print_envelope(cli: &Cli, envelope: &Value) {
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+        println!("{}", serde_json::to_string_pretty(envelope).unwrap());
     } else if let Some(lines) = envelope["result"]["lines"].as_array() {
         for l in lines {
             println!("{}", l.as_str().unwrap_or(""));
         }
     } else {
         let mut s = String::new();
-        render(&envelope, 0, &mut s);
+        render(envelope, 0, &mut s);
         print!("{s}");
     }
-    std::process::exit(exit);
+}
+
+fn run_ui(cli: &Cli) -> ! {
+    let Cmd::Ui { repo, port } = &cli.cmd else { unreachable!() };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    match ui_cmd::serve(&cwd, repo.as_deref(), *port, cli.json) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            print_envelope(cli, &json!({"contract_version": CONTRACT_VERSION, "ok": false, "error": e.to_json()}));
+            std::process::exit(e.exit)
+        }
+    }
 }

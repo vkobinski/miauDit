@@ -29,6 +29,17 @@ pub fn local_slug(repo: &std::path::Path) -> String {
     format!("local/{}", clean.trim_start_matches('.'))
 }
 
+pub async fn serve(repo: PathBuf, port: u16, audit_bin: PathBuf, on_ready: impl FnOnce(std::net::SocketAddr)) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let addr = listener.local_addr()?;
+    on_ready(addr);
+    axum::serve(listener, router(AppState { repo, port: addr.port(), audit_bin }))
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+}
+
 pub fn router(state: AppState) -> Router {
     let state = Arc::new(state);
     Router::new()
