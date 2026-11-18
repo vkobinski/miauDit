@@ -1,7 +1,6 @@
 #!/bin/bash
 set -u
 M="${MIAUDIT_BIN:-$HOME/.cargo/bin/miaudit}"
-UI="${MIAUDIT_UI_BIN:-$HOME/.cargo/bin/miaudit-ui}"
 SRV="${MIAUDIT_SERVER_BIN:-$HOME/.cargo/bin/miaudit-server}"
 pass=0
 fail=0
@@ -23,7 +22,7 @@ trap '[ -n "$UIPID" ] && { kill $UIPID 2>/dev/null; wait $UIPID 2>/dev/null; }; 
 UIPID=
 SRVPID=
 cd "$W" || exit 2
-echo "binary: $M sha256=$(shasum -a 256 "$M" | cut -c1-16) ui=$(shasum -a 256 "$UI" | cut -c1-16)"
+echo "binary: $M sha256=$(shasum -a 256 "$M" | cut -c1-16)"
 echo "workdir: $W"
 
 git init -q . && git config user.name e2e && git config user.email e2e@example.invalid && git config commit.gpgsign false
@@ -132,7 +131,7 @@ $M events --json >/dev/null; eq "events detects a deleted event (exit 2)" $? 2
 cp events.bak .miaudit/events.jsonl
 
 PORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])")
-"$UI" --repo "$W" --port "$PORT" >/dev/null 2>&1 &
+$M ui --repo "$W" --port "$PORT" >/dev/null 2>&1 &
 UIPID=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.3; done
 eq "viewer index returns 200" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")" 200

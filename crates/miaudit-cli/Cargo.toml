@@ -7,8 +7,14 @@ version.workspace = true
 name = "miaudit"
 path = "src/main.rs"
 
+[features]
+default = ["ui"]
+ui = ["dep:miaudit-ui", "dep:tokio"]
+
 [dependencies]
 miaudit-schema = { path = "../miaudit-schema" }
+miaudit-ui = { path = "../miaudit-ui", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal"], optional = true }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
