@@ -293,10 +293,10 @@ async fn audit_detail(State(s): State<Shared>, Path((owner, name, id)): Path<(St
         return api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "invalid audit id");
     }
     match s.db.load_view(&repo.repo_id, &id).await {
-        Ok(Some((view, checks))) => {
+        Ok(Some((view, checks, superseded))) => {
             let integrity = if checks.iter().any(|c| c.1 == "fail") { "fail" } else if checks.iter().any(|c| c.1 == "partial") { "partial" } else { "pass" };
             let ver = Verification::Result { integrity: integrity.into(), checks };
-            Json(api::detail_json(&view, &ver)).into_response()
+            Json(api::detail_json(&view, &ver, &superseded)).into_response()
         }
         Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "no such audit commit in this repository"),
         Err(e) => db_error(e),

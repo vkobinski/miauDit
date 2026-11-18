@@ -145,8 +145,8 @@ fn all_four_capabilities_become_observed_with_notes_and_gaps_turn_partial() {
     post(p, "Bash", json!({"command": "ls"}), json!({"stdout": "o", "exit_code": 0}));
     post(p, "Read", json!({"file_path": p.join("a.txt")}), json!({}));
     post(p, "Task", json!({"subagent_type": "x", "prompt": "p"}), json!({}));
-    hook(p, &["stop-check"], &json!({"hook_event_name": "Stop", "session_id": "s1", "last_assistant_message": "done"}));
     assert_eq!(audit(p, &["add", "a.txt"]).0, 0);
+    hook(p, &["stop-check"], &json!({"hook_event_name": "Stop", "session_id": "s1", "last_assistant_message": "done"}));
     let (code, c) = audit(p, &["commit", "-m", "m"]);
     assert_eq!(code, 0, "{c}");
     let id = c["result"]["audit_id"].as_str().unwrap().to_string();

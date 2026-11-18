@@ -92,6 +92,8 @@ pub struct DecisionInput {
     pub snapshot_id: String,
     #[serde(default)]
     pub evidence_links: Vec<EvidenceLink>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -159,6 +161,15 @@ impl Validate for DecisionInput {
         }
         if self.evidence_links.len() > 64 {
             return Err(Violation::schema("/evidence_links", "max 64 items"));
+        }
+        if self.supersedes.len() > 16 {
+            return Err(Violation::schema("/supersedes", "max 16 items"));
+        }
+        for (i, id) in self.supersedes.iter().enumerate() {
+            let hex = id.strip_prefix("dec_").unwrap_or("");
+            if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return Err(Violation::schema(format!("/supersedes/{i}"), "must be a decision id (dec_ followed by 64 lowercase hex)"));
+            }
         }
         Ok(())
     }
@@ -234,6 +245,24 @@ mod tests {
         let ev: EvidenceInput = parse_input(br#"{"schema_version":"1","classification":"internal","description":"d","content":"x"}"#).unwrap();
         let text = serde_json::to_string(&ev).unwrap();
         assert!(!text.contains("phase") && !text.contains("environment"));
+    }
+
+    #[test]
+    fn supersedes_is_optional_validated_and_absent_from_old_serialization() {
+        let plain: DecisionInput = parse_input(DECISION.as_bytes()).unwrap();
+        assert!(!serde_json::to_string(&plain).unwrap().contains("supersedes"));
+        let good = format!("dec_{}", "a".repeat(64));
+        let body = DECISION.replace("\"risks\":[]", &format!("\"risks\":[],\"supersedes\":[\"{good}\"]"));
+        let parsed: DecisionInput = parse_input(body.as_bytes()).unwrap();
+        assert_eq!(parsed.supersedes, vec![good]);
+        for bad in ["dec_short", "ctx_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "dec_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ""] {
+            let body = DECISION.replace("\"risks\":[]", &format!("\"risks\":[],\"supersedes\":[\"{bad}\"]"));
+            let err = parse_input::<DecisionInput>(body.as_bytes()).unwrap_err();
+            assert_eq!(err.field, "/supersedes/0", "{bad}");
+        }
+        let many: Vec<String> = (0..17).map(|_| format!("\"dec_{}\"", "b".repeat(64))).collect();
+        let body = DECISION.replace("\"risks\":[]", &format!("\"risks\":[],\"supersedes\":[{}]", many.join(",")));
+        assert_eq!(parse_input::<DecisionInput>(body.as_bytes()).unwrap_err().field, "/supersedes");
     }
 
     #[test]

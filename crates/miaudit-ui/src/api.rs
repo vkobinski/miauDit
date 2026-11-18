@@ -1,4 +1,4 @@
-use crate::data::{Verification, View};
+use crate::data::{Superseded, Verification, View};
 use miaudit_schema::model::StoredBinding;
 use serde_json::{Value, json};
 
@@ -44,7 +44,7 @@ pub fn page_of<T>(rows: &[T], page: u64, per_page: u64) -> &[T] {
     &rows[start..rows.len().min(start + per_page as usize)]
 }
 
-pub fn detail_json(v: &View, ver: &Verification) -> Value {
+pub fn detail_json(v: &View, ver: &Verification, superseded: &Superseded) -> Value {
     let mut manifest = serde_json::to_value(&v.manifest).unwrap_or(Value::Null);
     if let Some(snapshot) = manifest.get_mut("snapshot").and_then(Value::as_object_mut) {
         let count = snapshot.remove("entries").and_then(|e| e.as_array().map(Vec::len)).unwrap_or(0);
@@ -63,7 +63,11 @@ pub fn detail_json(v: &View, ver: &Verification) -> Value {
         "manifest": manifest,
         "bindings": v.bindings,
         "contexts": v.contexts.iter().map(|i| json!({"id": i.id, "object": i.object})).collect::<Vec<_>>(),
-        "decisions": v.decisions.iter().map(|i| json!({"id": i.id, "object": i.object})).collect::<Vec<_>>(),
+        "decisions": v.decisions.iter().map(|i| json!({
+            "id": i.id,
+            "object": i.object,
+            "superseded_by": superseded.get(&i.id).map(|l| l.iter().map(|(decision_id, audit_id)| json!({"decision_id": decision_id, "audit_id": audit_id})).collect::<Vec<_>>()).unwrap_or_default(),
+        })).collect::<Vec<_>>(),
         "evidence": v.evidence.iter().map(|e| json!({"id": e.id, "object": e.object, "preview": e.preview, "artifact_state": e.artifact_state, "image": e.image})).collect::<Vec<_>>(),
         "verification": verification,
     })

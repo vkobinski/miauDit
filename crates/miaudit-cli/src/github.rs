@@ -58,7 +58,15 @@ fn gh_user() -> Result<(String, u64), String> {
     Ok((login.to_string(), id))
 }
 
+pub fn resolve_author_without_network() -> Author {
+    resolve(false)
+}
+
 pub fn resolve_author() -> Author {
+    resolve(true)
+}
+
+fn resolve(ask_gh: bool) -> Author {
     if let Ok(v) = std::env::var("MIAUDIT_GITHUB_USER") {
         let login = v.trim();
         return if valid_login(login) {
@@ -72,6 +80,9 @@ pub fn resolve_author() -> Author {
         } else {
             unavailable("MIAUDIT_GITHUB_USER is not a valid GitHub login")
         };
+    }
+    if !ask_gh {
+        return unavailable("checkpoint: the gh lookup is skipped so the Stop hook stays fast");
     }
     match gh_user() {
         Ok((login, id)) => Author {

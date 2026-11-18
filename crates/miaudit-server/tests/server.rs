@@ -434,3 +434,44 @@ async fn audits_stored_before_gap_codes_existed_are_backfilled_on_open() {
     let (out, _) = remote(&live, &["audits", "acme/old", "--gap", "NO_HUMAN"]);
     assert_eq!(out["result"]["total"], 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_superseded_decision_is_reported_including_for_audits_stored_before_the_fields_existed() {
+    let Some(db) = test_db().await else { return };
+    let live = serve(&db, None).await;
+    let f = fixture("git@github.com:acme/keys.git", "keys audit");
+    let p = f.dir.path();
+    let bin = miaudit_bin();
+    let a = bin.to_str().unwrap();
+    let shown: Value = serde_json::from_str(&run(p, a, &["--json", "show", &f.audit_id]).0).unwrap();
+    let old = shown["result"]["objects"]["decisions"][0]["id"].as_str().unwrap().to_string();
+    let snap = serde_json::from_str::<Value>(&run(p, a, &["--json", "status"]).0).unwrap()["result"]["snapshot"]["id"].as_str().unwrap().to_string();
+    fs::write(p.join("d2.json"), format!(r#"{{"schema_version":"1","question":"keys?","choice":"added later","alternatives":[],"rationale":"r","risks":[],"snapshot_id":"{snap}","supersedes":["{old}"]}}"#)).unwrap();
+    let newer = serde_json::from_str::<Value>(&run(p, a, &["--json", "decision", "add", "--file", "d2.json"]).0).unwrap()["result"]["id"].as_str().unwrap().to_string();
+    let second = serde_json::from_str::<Value>(&run(p, a, &["--json", "commit", "-m", "follow-up"]).0).unwrap()["result"]["audit_id"].as_str().unwrap().to_string();
+    assert_eq!(push(&f, &live, &live.token, None).1, 0);
+
+    let check = |app: axum::Router| {
+        let (first, newer, second) = (f.audit_id.clone(), newer.clone(), second.clone());
+        async move {
+            let (s, _, body) = get(&app, &format!("/acme/keys/api/audits/{first}/detail"), None).await;
+            assert_eq!(s, StatusCode::OK);
+            let d: Value = serde_json::from_slice(&body).unwrap();
+            let marker = &d["decisions"][0]["superseded_by"][0];
+            assert_eq!((marker["decision_id"].as_str(), marker["audit_id"].as_str()), (Some(newer.as_str()), Some(second.as_str())));
+            let (_, _, body) = get(&app, &format!("/acme/keys/api/audits/{second}/detail"), None).await;
+            let d: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(d["decisions"][0]["superseded_by"].as_array().unwrap().len(), 0);
+        }
+    };
+    check(app(&db)).await;
+
+    let uri = std::env::var("MIAUDIT_TEST_MONGO_URI").unwrap();
+    let name = db.name().to_string();
+    let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
+    let database = client.database(&name);
+    database.collection::<mongodb::bson::Document>("audits").update_many(mongodb::bson::doc! {}, mongodb::bson::doc! {"$unset": {"decision_ids": ""}}).await.unwrap();
+    database.collection::<mongodb::bson::Document>("objects").update_many(mongodb::bson::doc! {}, mongodb::bson::doc! {"$unset": {"supersedes": ""}}).await.unwrap();
+    let reopened = Db::connect(&uri, &name).await.unwrap();
+    check(app(&reopened)).await;
+}

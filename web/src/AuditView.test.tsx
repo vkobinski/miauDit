@@ -69,6 +69,25 @@ describe("AuditView", () => {
     expect(screen.getByText("different snapshot")).toBeInTheDocument();
   });
 
+  it("marks a superseded decision and links the audit that holds the newer one", () => {
+    const d = detail();
+    d.decisions[0]!.superseded_by = [{ decision_id: `dec_${"7".repeat(64)}`, audit_id: `audit_${"6".repeat(64)}` }];
+    const { container } = show(d);
+    expect(screen.getByText("superseded", { selector: ".badge" })).toBeInTheDocument();
+    expect(container.querySelector(`a[href="/acme/web/audit/audit_${"6".repeat(64)}"]`)).not.toBeNull();
+    expect(screen.getByText(/This record is unchanged/)).toBeInTheDocument();
+  });
+
+  it("lists what a newer decision supersedes, as text", () => {
+    const d = detail();
+    d.decisions[0]!.object!.body.supersedes = [`dec_${"5".repeat(64)}`, "<img src=x onerror=alert(1)>"];
+    const { container } = show(d);
+    expect(screen.getByText("Supersedes")).toBeInTheDocument();
+    expect(screen.getByText(`dec_${"5".repeat(64)}`)).toBeInTheDocument();
+    expect(container.querySelector("img[onerror]")).toBeNull();
+    expect(screen.queryByText("superseded", { selector: ".badge" })).toBeNull();
+  });
+
   it("breadcrumbs link back to the repository", () => {
     show();
     const crumb = document.querySelector(".crumb")!;

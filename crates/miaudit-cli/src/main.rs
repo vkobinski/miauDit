@@ -77,6 +77,9 @@ enum Cmd {
         agent: events::Agent,
     },
     SessionStart,
+    Checkpoints {
+        state: Option<String>,
+    },
     Project { #[command(subcommand)] op: ProjectOp },
     Show { id: String },
     Verify { id: String },
@@ -170,6 +173,7 @@ fn run(cli: &Cli) -> error::Res<Out> {
         Cmd::Bindings { audit_id } => commands::bindings(&ctx, audit_id.as_deref()),
         Cmd::Related { git_commit } => commands::related(&ctx, git_commit),
         Cmd::Events => commands::events_status(&ctx),
+        Cmd::Checkpoints { state } => commands::checkpoints_setting(&ctx, state.as_deref()),
         Cmd::Project { op: ProjectOp::Init } => commands::project_init(&ctx),
         Cmd::Project { op: ProjectOp::Check } => commands::project_check(&ctx),
         Cmd::Capture { .. } | Cmd::StopCheck { .. } | Cmd::SessionStart => unreachable!("handled before the JSON envelope"),
@@ -249,16 +253,17 @@ fn run_hook(cmd: &Cmd) -> ! {
             {
                 eprintln!("miaudit: stop capture failed: {}", e.rule);
             }
-            if input.as_ref().and_then(|v| v.get("stop_hook_active")).and_then(Value::as_bool) == Some(true) {
-                std::process::exit(0);
+            let again = input.as_ref().and_then(|v| v.get("stop_hook_active")).and_then(Value::as_bool) == Some(true);
+            if !again && let Some(msg) = commands::stop_check(&ctx) {
+                eprintln!("{msg}");
+                std::process::exit(2);
             }
-            match commands::stop_check(&ctx) {
-                Some(msg) => {
-                    eprintln!("{msg}");
-                    std::process::exit(2)
-                }
-                None => std::process::exit(0),
+            match commands::checkpoint(&ctx) {
+                Ok(Some(out)) => eprintln!("miaudit: checkpoint {} recorded", out.value["audit_id"].as_str().unwrap_or("?")),
+                Ok(None) => {}
+                Err(e) => eprintln!("miaudit: checkpoint failed: {}", e.rule),
             }
+            std::process::exit(0)
         }
         _ => std::process::exit(0),
     }

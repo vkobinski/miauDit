@@ -301,3 +301,33 @@ async fn pull_request_bindings_are_exposed_on_list_and_detail() {
     let with_pr = detail["bindings"].as_array().unwrap().iter().find(|b| !b["body"]["pull_request"].is_null()).expect("the PR binding is in the detail");
     assert_eq!((with_pr["body"]["pull_request"]["state"].as_str(), with_pr["body"]["pull_request"]["head_commit"].as_str()), (Some("OPEN"), Some(sha.as_str())));
 }
+
+#[tokio::test]
+async fn a_superseded_decision_points_to_the_audit_that_replaces_it() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path();
+    let bin = audit_bin();
+    let a = bin.to_str().unwrap();
+    let j = |args: &[&str]| json(&run(p, a, args));
+    j(&["--json", "init", "--no-hooks"]);
+    fs::write(p.join("f.txt"), "x").unwrap();
+    j(&["--json", "add", "f.txt"]);
+    let snap = j(&["--json", "status"])["result"]["snapshot"]["id"].as_str().unwrap().to_string();
+    fs::write(p.join("d1.json"), format!(r#"{{"schema_version":"1","question":"keys?","choice":"left for the developer","alternatives":[],"rationale":"r","risks":[],"snapshot_id":"{snap}"}}"#)).unwrap();
+    let old = j(&["--json", "decision", "add", "--file", "d1.json"])["result"]["id"].as_str().unwrap().to_string();
+    let first = j(&["--json", "commit", "-m", "first"])["result"]["audit_id"].as_str().unwrap().to_string();
+    let snap2 = j(&["--json", "status"])["result"]["snapshot"]["id"].as_str().unwrap().to_string();
+    fs::write(p.join("d2.json"), format!(r#"{{"schema_version":"1","question":"keys?","choice":"added","alternatives":[],"rationale":"token given","risks":[],"snapshot_id":"{snap2}","supersedes":["{old}"]}}"#)).unwrap();
+    let newer = j(&["--json", "decision", "add", "--file", "d2.json"])["result"]["id"].as_str().unwrap().to_string();
+    let second = j(&["--json", "commit", "-m", "follow-up with no file changes"])["result"]["audit_id"].as_str().unwrap().to_string();
+
+    let app = app(&d);
+    let slug = slug(&d);
+    let first_detail = json(&get(&app, "GET", &format!("/{slug}/api/audits/{first}/detail"), HOST).await.2);
+    let marker = &first_detail["decisions"][0]["superseded_by"][0];
+    assert_eq!((marker["decision_id"].as_str(), marker["audit_id"].as_str()), (Some(newer.as_str()), Some(second.as_str())));
+    let second_detail = json(&get(&app, "GET", &format!("/{slug}/api/audits/{second}/detail"), HOST).await.2);
+    assert_eq!(second_detail["decisions"][0]["object"]["body"]["supersedes"][0], old.as_str());
+    assert_eq!(second_detail["decisions"][0]["superseded_by"].as_array().unwrap().len(), 0);
+    assert_eq!(second_detail["manifest"]["snapshot"]["changes"].as_array().unwrap().len(), 0);
+}

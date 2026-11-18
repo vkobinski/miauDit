@@ -3,10 +3,11 @@ use crate::ingest::{self, Rejection};
 use futures_util::TryStreamExt;
 use miaudit_schema::{
     digest::sha256_hex,
+    input::DecisionInput,
     media::image_mime,
     model::{EvidenceBody, Manifest, Stored, StoredBinding},
 };
-use miaudit_ui::data::{EvidenceView, Item, View};
+use miaudit_ui::data::{EvidenceView, Item, Superseded, View};
 use mongodb::{
     Client, Collection, Database, IndexModel,
     bson::{Binary, Document, doc, spec::BinarySubtype},
@@ -59,6 +60,8 @@ pub struct AuditDoc {
     pub gaps: i64,
     #[serde(default)]
     pub gap_codes: Vec<String>,
+    #[serde(default)]
+    pub decision_ids: Vec<String>,
     pub parents: Vec<String>,
     pub received_at: String,
 }
@@ -68,6 +71,8 @@ struct ObjectDoc {
     repo_id: String,
     id: String,
     raw: String,
+    #[serde(default)]
+    supersedes: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -177,14 +182,38 @@ impl Db {
     }
 
     async fn backfill_gap_codes(&self) -> R<()> {
-        let old: Vec<AuditDoc> = self.audits.find(doc! {"gap_codes": {"$exists": false}}).await?.try_collect().await?;
+        let old: Vec<AuditDoc> = self.audits.find(doc! {"$or": [{"gap_codes": {"$exists": false}}, {"decision_ids": {"$exists": false}}]}).await?.try_collect().await?;
         for a in old {
             if let Ok(m) = serde_json::from_str::<Manifest>(&a.raw) {
                 let codes: Vec<String> = m.gaps.iter().map(|g| g.code.clone()).collect();
-                self.audits.update_one(doc! {"repo_id": &a.repo_id, "audit_id": &a.audit_id}, doc! {"$set": {"gap_codes": codes}}).await?;
+                self.audits.update_one(doc! {"repo_id": &a.repo_id, "audit_id": &a.audit_id}, doc! {"$set": {"gap_codes": codes, "decision_ids": m.decision_ids.clone()}}).await?;
             }
         }
+        let objects: Vec<ObjectDoc> = self.objects.find(doc! {"id": {"$regex": "^dec_"}, "supersedes": {"$exists": false}}).await?.try_collect().await?;
+        for o in objects {
+            self.objects.update_one(doc! {"repo_id": &o.repo_id, "id": &o.id}, doc! {"$set": {"supersedes": decision_supersedes(&o.raw)}}).await?;
+        }
         Ok(())
+    }
+
+    pub async fn superseded_by(&self, repo_id: &str, decision_ids: &[String]) -> R<Superseded> {
+        let mut out = Superseded::new();
+        if decision_ids.is_empty() {
+            return Ok(out);
+        }
+        let newer: Vec<ObjectDoc> = self.objects.find(doc! {"repo_id": repo_id, "supersedes": {"$in": decision_ids}}).await?.try_collect().await?;
+        if newer.is_empty() {
+            return Ok(out);
+        }
+        let newer_ids: Vec<String> = newer.iter().map(|o| o.id.clone()).collect();
+        let audits: Vec<AuditDoc> = self.audits.find(doc! {"repo_id": repo_id, "decision_ids": {"$in": &newer_ids}}).sort(doc! {"created_at": 1}).await?.try_collect().await?;
+        for o in &newer {
+            let Some(a) = audits.iter().find(|a| a.decision_ids.contains(&o.id)) else { continue };
+            for old in o.supersedes.iter().filter(|x| decision_ids.contains(x)) {
+                out.entry(old.clone()).or_default().push((o.id.clone(), a.audit_id.clone()));
+            }
+        }
+        Ok(out)
     }
 
 
@@ -299,7 +328,8 @@ impl Db {
             return Ok(false);
         }
         let raw = String::from_utf8(bytes.to_vec()).map_err(|_| Rejection { code: "BAD_JSON", message: "not UTF-8".into() })?;
-        self.insert_new(&self.objects, ObjectDoc { repo_id: repo_id.into(), id: id.into(), raw }).await?;
+        let supersedes = decision_supersedes(&raw);
+        self.insert_new(&self.objects, ObjectDoc { repo_id: repo_id.into(), id: id.into(), raw, supersedes }).await?;
         self.touch(repo_id).await?;
         Ok(true)
     }
@@ -321,6 +351,7 @@ impl Db {
             changes: m.snapshot.changes.len() as i64,
             gaps: m.gaps.len() as i64,
             gap_codes: m.gaps.iter().map(|g| g.code.clone()).collect(),
+            decision_ids: m.decision_ids.clone(),
             parents: m.parents.clone(),
             received_at: now(),
         };
@@ -483,7 +514,7 @@ impl Db {
         Ok(image_mime(&bytes).map(|m| (m, bytes)))
     }
 
-    pub async fn load_view(&self, repo_id: &str, audit_id: &str) -> R<Option<(View, Vec<(String, String, String)>)>> {
+    pub async fn load_view(&self, repo_id: &str, audit_id: &str) -> R<Option<(View, Vec<(String, String, String)>, Superseded)>> {
         let Some(raw) = self.raw_commit(repo_id, audit_id).await? else { return Ok(None) };
         let Ok(m) = serde_json::from_str::<Manifest>(&raw) else { return Ok(None) };
         let bindings = self.bindings_for(repo_id, &[audit_id.to_string()]).await?;
@@ -561,8 +592,13 @@ impl Db {
             decisions: m.decision_ids.iter().map(|i| Item { id: i.clone(), object: parse(&raws, i) }).collect(),
             evidence,
         };
-        Ok(Some((view, checks)))
+        let superseded = self.superseded_by(repo_id, &m.decision_ids).await?;
+        Ok(Some((view, checks, superseded)))
     }
+}
+
+fn decision_supersedes(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Stored<DecisionInput>>(raw).map(|d| d.body.supersedes).unwrap_or_default()
 }
 
 fn is_dup(e: &mongodb::error::Error) -> bool {

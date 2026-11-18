@@ -129,6 +129,7 @@ export interface DecisionBody {
   risks: string[];
   snapshot_id: string;
   evidence_links: { evidence_id: string; relation: string }[];
+  supersedes?: string[];
 }
 
 export interface EvidenceBody {
@@ -143,6 +144,10 @@ export interface EvidenceBody {
 export interface Item<T> {
   id: string;
   object: Stored<T> | null;
+}
+
+export interface DecisionItem extends Item<DecisionBody> {
+  superseded_by: { decision_id: string; audit_id: string }[];
 }
 
 export interface EvidenceItem extends Item<EvidenceBody> {
@@ -160,7 +165,7 @@ export interface AuditDetail {
   manifest: Manifest;
   bindings: Binding[];
   contexts: Item<ContextBody>[];
-  decisions: Item<DecisionBody>[];
+  decisions: DecisionItem[];
   evidence: EvidenceItem[];
   verification: Verification;
 }

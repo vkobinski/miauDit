@@ -89,7 +89,7 @@ pub fn init(cwd: &Path, hooks: bool, local: bool) -> Res<Out> {
     let probe = cwd.join(".audit-case-probe-x");
     let case_sensitive = fs::write(&probe, b"").ok().map(|_| !cwd.join(".AUDIT-CASE-PROBE-X").exists());
     let _ = fs::remove_file(&probe);
-    let config = Config { schema_version: SCHEMA_VERSION.into(), repo_id: format!("repo_{}", uuid::Uuid::new_v4().simple()), created_at: now(), case_sensitive };
+    let config = Config { schema_version: SCHEMA_VERSION.into(), repo_id: format!("repo_{}", uuid::Uuid::new_v4().simple()), created_at: now(), case_sensitive, checkpoints: None };
     let s = Store::init(&cwd, &config)?;
     project::init(&s)?;
     if let Some(p) = &plan {
@@ -230,6 +230,11 @@ pub fn decision_add(ctx: &Ctx, file: &str) -> Res<Out> {
             return Err(CliError::validation("EVIDENCE_REFERENCE_UNAVAILABLE", "evidence reference is unavailable").field(format!("/evidence_links/{i}/evidence_id")));
         }
     }
+    for (i, old) in input.supersedes.iter().enumerate() {
+        if ctx.store.get_object::<DecisionInput>(old)?.is_none() {
+            return Err(CliError::validation("DECISION_REFERENCE_UNAVAILABLE", "the decision this one supersedes is not in the store").field(format!("/supersedes/{i}")));
+        }
+    }
     let (id, bytes) = object_id("dec", DOMAIN_DECISION, &Stored::self_reported("decision", input))?;
     record(ctx, id, bytes, |p| &mut p.decisions)
 }
@@ -308,9 +313,12 @@ fn partial_note(name: &str, s: &events::Summary) -> Option<String> {
     }
 }
 
-fn unavailable_gap_message(cap: &str, obs: &Observed) -> String {
+fn unavailable_gap_message(cap: &str, obs: &Observed, after_checkpoint: bool) -> String {
     if let Some(e) = &obs.chain_error {
         return format!("not recorded: the hook event log failed its integrity check ({e}), so none of its events were used; see EVENT_CHAIN_BROKEN");
+    }
+    if obs.events.is_empty() && after_checkpoint {
+        return "not recorded in this audit commit: no hook events exist since the last audit commit, which is an automatic checkpoint; the events of the preceding turns are in that checkpoint".into();
     }
     if obs.events.is_empty() {
         return "not recorded: no hook events exist since the last audit commit; the Claude Code or Codex hooks are not installed in this repository or did not fire (check `miaudit events` and the hooks in .claude/settings.json)".into();
@@ -499,10 +507,11 @@ fn compute_gaps(ctx: &Ctx, p: &Pending, git: &GitBaseline) -> Res<Vec<Gap>> {
     g.extend(evidence_gaps(ctx, p)?);
     g.extend(observed_gaps(ctx, &observed(ctx))?);
     let obs_now = observed(ctx);
+    let after_checkpoint = ctx.store.head().ok().flatten().and_then(|h| ctx.store.get_commit(&h).ok().flatten()).is_some_and(|m| m.gaps.iter().any(|g| g.code == "AUTO_CHECKPOINT"));
     for cap in UNAVAILABLE_CAPABILITIES {
         match partial_note(cap, &obs_now.summary).filter(|_| obs_now.chain_error.is_none()) {
             Some(note) => g.push(gap(&format!("CAPTURE_PARTIAL:{cap}"), &note, vec![cap.into()])),
-            None => g.push(gap(&format!("CAPTURE_UNAVAILABLE:{cap}"), &unavailable_gap_message(cap, &obs_now), vec![cap.into()])),
+            None => g.push(gap(&format!("CAPTURE_UNAVAILABLE:{cap}"), &unavailable_gap_message(cap, &obs_now, after_checkpoint), vec![cap.into()])),
         }
     }
     g.push(gap("NO_HUMAN_APPROVAL", "no human disposition recorded; approvals are separate attestations", vec![]));
@@ -515,12 +524,79 @@ pub fn gaps(ctx: &Ctx) -> Res<Out> {
 }
 
 pub fn commit(ctx: &Ctx, message: &str) -> Res<Out> {
+    commit_with(ctx, message, false)
+}
+
+fn checkpoints_enabled(ctx: &Ctx) -> bool {
+    if std::env::var("MIAUDIT_CHECKPOINT").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no")) {
+        return false;
+    }
+    ctx.store.config().map(|c| c.checkpoints != Some(false)).unwrap_or(true)
+}
+
+fn checkpoint_message(s: &events::Summary, total: usize) -> String {
+    let parts: Vec<String> = [
+        (s.prompts, "prompt"),
+        (s.assistant_messages, "assistant message digest"),
+        (s.commands, "command"),
+        (s.resources, "resource access"),
+        (s.agent_events, "agent event"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, label)| format!("{n} {label}{}", if *n == 1 { "" } else { "s" }))
+    .collect();
+    if parts.is_empty() {
+        format!("checkpoint: {total} hook event(s) since the last audit commit")
+    } else {
+        format!("checkpoint: {} since the last audit commit", parts.join(", "))
+    }
+}
+
+pub fn checkpoint(ctx: &Ctx) -> Res<Option<Out>> {
+    if !checkpoints_enabled(ctx) {
+        return Ok(None);
+    }
+    let obs = observed(ctx);
+    if obs.chain_error.is_some() || obs.events.is_empty() || !obs.summary.last_digest.is_empty() {
+        return Ok(None);
+    }
+    let (base, cur) = ctx.current()?;
+    let pending = ctx.store.pending()?;
+    if !diff_trees(&base, &cur).is_empty() || !pending.contexts.is_empty() || !pending.decisions.is_empty() || !pending.evidence.is_empty() {
+        return Ok(None);
+    }
+    let message = checkpoint_message(&obs.summary, obs.events.len());
+    commit_with(ctx, &message, true).map(Some)
+}
+
+pub fn checkpoints_setting(ctx: &Ctx, state: Option<&str>) -> Res<Out> {
+    let mut config = ctx.store.config()?;
+    match state {
+        None => {}
+        Some("on") => config.checkpoints = None,
+        Some("off") => config.checkpoints = Some(false),
+        Some(_) => return Err(CliError::validation("BAD_ARGUMENT", "use `on`, `off` or no argument").field("/state")),
+    }
+    if state.is_some() {
+        ctx.store.save_config(&config)?;
+    }
+    let env_off = std::env::var("MIAUDIT_CHECKPOINT").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no"));
+    ok(json!({
+        "checkpoints": checkpoints_enabled(ctx),
+        "stored_setting": if config.checkpoints == Some(false) { "off" } else { "on (default)" },
+        "disabled_by_environment": env_off,
+        "note": "at each Stop the hook records an observed-only checkpoint audit when hook events exist, nothing is staged or pending, and no edited file is waiting to be audited; MIAUDIT_CHECKPOINT=0 disables it for one run",
+    }))
+}
+
+fn commit_with(ctx: &Ctx, message: &str, automatic: bool) -> Res<Out> {
     if message.trim().is_empty() || message.chars().count() > 512 {
         return Err(CliError::validation("SCHEMA_VIOLATION", "message must be 1-512 characters").field("/message"));
     }
     let (base, cur) = ctx.current()?;
     let pending = ctx.store.pending()?;
-    if diff_trees(&base, &cur).is_empty() && pending.contexts.is_empty() && pending.decisions.is_empty() && pending.evidence.is_empty() {
+    if diff_trees(&base, &cur).is_empty() && pending.contexts.is_empty() && pending.decisions.is_empty() && pending.evidence.is_empty() && !automatic {
         return Err(CliError::validation("NOTHING_STAGED", "no staged changes and no pending context, decisions or evidence"));
     }
     let td = tree_digest(&cur)?;
@@ -535,8 +611,11 @@ pub fn commit(ctx: &Ctx, message: &str) -> Res<Out> {
     }
     let git = git_baseline(&ctx.store.root);
     let config = ctx.store.config()?;
-    let author = github::resolve_author();
+    let author = if automatic { github::resolve_author_without_network() } else { github::resolve_author() };
     let obs = observed(ctx);
+    if automatic && (obs.events.is_empty() || obs.chain_error.is_some()) {
+        return Err(CliError::validation("NOTHING_STAGED", "no observed events to checkpoint"));
+    }
     let mut evidence_ids = pending.evidence.clone();
     let mut last_seq = None;
     if !obs.events.is_empty() && obs.chain_error.is_none() {
@@ -587,6 +666,9 @@ pub fn commit(ctx: &Ctx, message: &str) -> Res<Out> {
         coverage: coverage(&obs),
         gaps: {
             let mut g = compute_gaps(ctx, &pending, &git)?;
+            if automatic {
+                g.push(gap("AUTO_CHECKPOINT", "recorded automatically by the Stop hook: it holds hook-observed event receipts only, no context, decisions or claims written by the agent", vec![]));
+            }
             match author.provenance {
                 Provenance::Unavailable => g.push(gap("AUTHOR_UNAVAILABLE", &format!("no GitHub user could be recorded: {}", author.verification), vec![])),
                 Provenance::SelfReported => g.push(gap("AUTHOR_ASSERTED", "the GitHub user comes from MIAUDIT_GITHUB_USER and was not authenticated", vec![])),
@@ -604,7 +686,7 @@ pub fn commit(ctx: &Ctx, message: &str) -> Res<Out> {
     ctx.store.save_index(&Default::default())?;
     ctx.store.save_pending(&Default::default())?;
     ok(json!({
-        "audit_id": id, "snapshot_id": sid,
+        "audit_id": id, "snapshot_id": sid, "automatic": automatic,
         "accepted": true, "verified": false, "policy_passed": "not_evaluated", "human_approved": false,
         "gaps": manifest.gaps.len(), "note": "an audit commit preserves history; it does not imply policy success or approval",
     }))
