@@ -61,6 +61,10 @@ fn fixture(remote: &str, description: &str) -> Fixture {
     Fixture { dir: d, audit_id }
 }
 
+async fn db_name_of(db: &Db) -> String {
+    db.name().to_string()
+}
+
 async fn test_db() -> Option<Db> {
     let Ok(uri) = std::env::var("MIAUDIT_TEST_MONGO_URI") else {
         eprintln!("SKIPPED: MIAUDIT_TEST_MONGO_URI is not set, no MongoDB to test against");
@@ -300,4 +304,106 @@ async fn unknown_pages_and_bad_ids_are_404() {
     for bad in ["/nothing", "/no/such", "/acme/web/audit/nope", "/acme/web/audit/audit_..%2F..", "/a%20b/c", "/api/x"] {
         assert_eq!(get(&app, bad, None).await.0, StatusCode::NOT_FOUND, "{bad}");
     }
+}
+
+fn remote(live: &Live, args: &[&str]) -> (Value, i32) {
+    let bin = miaudit_bin();
+    let mut full = vec!["--json", "remote", "--server", live.addr.as_str()];
+    full.extend(args);
+    let out = Command::new(bin).current_dir(std::env::temp_dir()).args(full).output().unwrap();
+    (serde_json::from_slice(&out.stdout).unwrap(), out.status.code().unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_queries_repos_audits_and_filters_by_gap_and_author() {
+    let Some(db) = test_db().await else { return };
+    let live = serve(&db, None).await;
+    let a = fixture("git@github.com:acme/one.git", "audit of one");
+    let b = fixture("git@github.com:acme/two.git", "audit of two");
+    assert_eq!(push(&a, &live, &live.token, None).1, 0);
+    assert_eq!(push(&b, &live, &live.token, None).1, 0);
+
+    let (out, code) = remote(&live, &["repos"]);
+    assert_eq!(code, 0, "{out}");
+    let slugs: Vec<&str> = out["result"]["repos"].as_array().unwrap().iter().map(|r| r["slug"].as_str().unwrap()).collect();
+    assert!(slugs.contains(&"acme/one") && slugs.contains(&"acme/two"), "{slugs:?}");
+
+    let (out, _) = remote(&live, &["audits", "acme/one"]);
+    assert_eq!(out["result"]["total"], 1);
+    let row = &out["result"]["audits"][0];
+    assert_eq!(row["audit_id"], a.audit_id.as_str());
+    assert_eq!(row["author"], "test-user");
+    assert!(row["gap_codes"].as_array().unwrap().iter().any(|c| c == "NO_HUMAN_APPROVAL"));
+    assert_eq!(row["git"][0]["correspondence"], "full");
+
+    let (out, _) = remote(&live, &["audits", "acme/one", "--gap", "CAPTURE_UNAVAILABLE"]);
+    assert_eq!(out["result"]["total"], 1, "the fixture has no hook events, so every capture capability is unavailable");
+    let (out, _) = remote(&live, &["audits", "acme/one", "--gap", "CAPTURE_PARTIAL"]);
+    assert_eq!(out["result"]["total"], 0);
+    let (out, _) = remote(&live, &["audits", "acme/one", "--gap", "NO_SUCH.*"]);
+    assert_eq!(out["result"]["total"], 0, "the gap filter must not be treated as a regex");
+    let (out, _) = remote(&live, &["audits", "acme/one", "--author", "test-user"]);
+    assert_eq!(out["result"]["total"], 1);
+    let (out, _) = remote(&live, &["audits", "acme/one", "--author", "nobody"]);
+    assert_eq!(out["result"]["total"], 0);
+    let (out, _) = remote(&live, &["audits", "acme/one", "--all"]);
+    assert_eq!(out["result"]["audits"].as_array().unwrap().len(), 1);
+
+    let (out, code) = remote(&live, &["show", "acme/one", &a.audit_id]);
+    assert_eq!(code, 0);
+    assert_eq!(out["result"]["manifest"]["description"], "audit of one");
+    let lines = out["result"]["lines"].as_array().unwrap();
+    assert!(lines.iter().any(|l| l.as_str().unwrap().contains("CAPTURE_UNAVAILABLE:agent_topology")));
+
+    let (out, code) = remote(&live, &["show", "acme/one", &b.audit_id]);
+    assert_eq!((code, out["error"]["code"].as_str()), (2, Some("REMOTE_NOT_FOUND")), "an audit of repo two is not under repo one");
+    let (out, code) = remote(&live, &["audits", "../etc"]);
+    assert_eq!((code, out["error"]["code"].as_str()), (2, Some("BAD_REPO")));
+    let (out, code) = remote(&live, &["audits", "acme/nothing"]);
+    assert_eq!((code, out["error"]["code"].as_str()), (2, Some("REMOTE_NOT_FOUND")));
+
+    let bin = miaudit_bin();
+    let text = Command::new(&bin).current_dir(std::env::temp_dir()).args(["remote", "--server", &live.addr, "audits", "acme/one"]).output().unwrap();
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("1 audit commit(s) match in acme/one") && text.contains(&a.audit_id[..18]) && text.contains("@test-user"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_password_is_sent_by_the_remote_commands() {
+    let Some(db) = test_db().await else { return };
+    let live = serve(&db, Some("s3cret")).await;
+    let bin = miaudit_bin();
+    let run = |pw: Option<&str>| {
+        let mut c = Command::new(&bin);
+        c.current_dir(std::env::temp_dir()).args(["--json", "remote", "--server", &live.addr, "repos"]);
+        if let Some(p) = pw {
+            c.env("MIAUDIT_READ_PASSWORD", p);
+        }
+        let out = c.output().unwrap();
+        (serde_json::from_slice::<Value>(&out.stdout).unwrap(), out.status.code().unwrap())
+    };
+    let (out, code) = run(None);
+    assert_eq!((code, out["error"]["code"].as_str()), (2, Some("REMOTE_UNAUTHORIZED")));
+    let (_, code) = run(Some("wrong"));
+    assert_eq!(code, 2);
+    let (_, code) = run(Some("s3cret"));
+    assert_eq!(code, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn audits_stored_before_gap_codes_existed_are_backfilled_on_open() {
+    let Some(db) = test_db().await else { return };
+    let live = serve(&db, None).await;
+    let f = fixture("git@github.com:acme/old.git", "old audit");
+    assert_eq!(push(&f, &live, &live.token, None).1, 0);
+    let uri = std::env::var("MIAUDIT_TEST_MONGO_URI").unwrap();
+    let db_name = db_name_of(&db).await;
+    let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
+    let audits = client.database(&db_name).collection::<mongodb::bson::Document>("audits");
+    audits.update_many(mongodb::bson::doc! {}, mongodb::bson::doc! {"$unset": {"gap_codes": ""}}).await.unwrap();
+    assert_eq!(audits.count_documents(mongodb::bson::doc! {"gap_codes": {"$exists": false}}).await.unwrap(), 1);
+    Db::connect(&uri, &db_name).await.unwrap();
+    assert_eq!(audits.count_documents(mongodb::bson::doc! {"gap_codes": {"$exists": false}}).await.unwrap(), 0);
+    let (out, _) = remote(&live, &["audits", "acme/old", "--gap", "NO_HUMAN"]);
+    assert_eq!(out["result"]["total"], 1);
 }

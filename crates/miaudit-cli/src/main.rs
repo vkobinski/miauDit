@@ -5,6 +5,7 @@ mod git;
 mod github;
 mod project;
 mod push;
+mod remote;
 mod snapshot;
 mod store;
 
@@ -74,6 +75,32 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
+    Remote {
+        #[arg(long, global = true)]
+        server: Option<String>,
+        #[command(subcommand)]
+        op: RemoteOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteOp {
+    Repos,
+    Audits {
+        repo: String,
+        #[arg(long)]
+        author: Option<String>,
+        #[arg(long)]
+        gap: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        page: u64,
+        #[arg(long)]
+        all: bool,
+    },
+    Show {
+        repo: String,
+        audit_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -100,6 +127,14 @@ fn run(cli: &Cli) -> error::Res<Out> {
     if let Cmd::Init = cli.cmd {
         return commands::init(&cwd);
     }
+    if let Cmd::Remote { server, op } = &cli.cmd {
+        let r = remote::Remote::new(server.as_deref())?;
+        return match op {
+            RemoteOp::Repos => remote::repos(&r),
+            RemoteOp::Audits { repo, author, gap, page, all } => remote::audits(&r, &remote::AuditsQuery { slug: repo, author: author.as_deref(), gap: gap.as_deref(), page: *page, all: *all }),
+            RemoteOp::Show { repo, audit_id } => remote::show(&r, repo, audit_id),
+        };
+    }
     let ctx = Ctx::open(&cwd)?;
     match &cli.cmd {
         Cmd::Init => unreachable!(),
@@ -124,6 +159,7 @@ fn run(cli: &Cli) -> error::Res<Out> {
         Cmd::Show { id } => commands::show(&ctx, id),
         Cmd::Verify { id } => commands::verify(&ctx, id),
         Cmd::Push { server, name } => push::push(&ctx, server.as_deref(), name.as_deref()),
+        Cmd::Remote { .. } => unreachable!(),
     }
 }
 
@@ -222,6 +258,10 @@ fn main() {
     };
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+    } else if let Some(lines) = envelope["result"]["lines"].as_array() {
+        for l in lines {
+            println!("{}", l.as_str().unwrap_or(""));
+        }
     } else {
         let mut s = String::new();
         render(&envelope, 0, &mut s);
