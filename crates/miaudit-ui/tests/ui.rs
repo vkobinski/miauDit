@@ -176,3 +176,26 @@ async fn screenshot_evidence_is_rendered_and_only_real_images_are_served() {
     let (s, _, _) = get(&app, "GET", &format!("/audit/{id}/evidence/{e1}/image"), "evil.example").await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn pull_request_links_render_on_list_and_detail_pages() {
+    use std::os::unix::fs::PermissionsExt;
+    let (d, id) = fixture();
+    let sha = git(d.path(), &["rev-parse", "HEAD"]);
+    let gh = tempfile::tempdir().unwrap();
+    let script = gh.path().join("gh");
+    fs::write(&script, format!("#!/bin/sh\necho '{{\"number\":7,\"url\":\"https://github.com/acme/repo/pull/7\",\"headRefOid\":\"{sha}\",\"state\":\"OPEN\"}}'\n")).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = audit_bin();
+    let out = Command::new(&bin).env("PATH", format!("{}:/usr/bin:/bin", gh.path().display())).env("MIAUDIT_GITHUB_USER", "test-user").current_dir(d.path()).args(["--json", "bind", &id, "--pr", "7"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+
+    let app = app(&d);
+    for uri in ["/".to_string(), format!("/audit/{id}")] {
+        let (s, _, body) = get(&app, "GET", &uri, HOST).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains(r#"href="https://github.com/acme/repo/pull/7""#) && body.contains("PR #7"), "{uri}");
+    }
+    let (_, _, detail) = get(&app, "GET", &format!("/audit/{id}"), HOST).await;
+    assert!(detail.contains("Pull request") && detail.contains("OPEN"));
+}

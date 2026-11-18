@@ -724,14 +724,25 @@ pub fn verify(ctx: &Ctx, id: &str) -> Res<Out> {
     finish(id, checks, worst)
 }
 
-pub fn bind(ctx: &Ctx, audit_id: &str, rev: &str, assert: bool) -> Res<Out> {
-    bind_inner(ctx, audit_id, rev, assert, true)
+pub fn bind(ctx: &Ctx, audit_id: &str, rev: Option<&str>, pr: Option<&str>, assert: bool) -> Res<Out> {
+    match (rev, pr) {
+        (Some(rev), None) => bind_inner(ctx, audit_id, rev, None, assert, true),
+        (None, Some(pr)) => {
+            let found = crate::pr::resolve(&ctx.store.root, pr)?;
+            let head = found.head_commit.clone();
+            bind_inner(ctx, audit_id, &head, Some(found), assert, true)
+        }
+        _ => Err(CliError::validation("BIND_TARGET", "pass exactly one of --git-commit or --pr")),
+    }
 }
 
-fn bind_inner(ctx: &Ctx, audit_id: &str, rev: &str, assert: bool, record: bool) -> Res<Out> {
+fn bind_inner(ctx: &Ctx, audit_id: &str, rev: &str, pr: Option<PullRequestRef>, assert: bool, record: bool) -> Res<Out> {
     let m = ctx.store.get_commit(audit_id)?.ok_or_else(|| CliError::validation("OBJECT_NOT_FOUND", format!("{audit_id} not found")))?;
     let root = &ctx.store.root;
-    let (commit, algorithm) = git::resolve_commit(root, rev)?;
+    let (commit, algorithm) = git::resolve_commit(root, rev).map_err(|e| match &pr {
+        Some(p) if e.code == "GIT_COMMIT_NOT_FOUND" => CliError::validation("PR_HEAD_NOT_LOCAL", format!("the head commit {} of pull request #{} is not in this repository; fetch it with `git fetch origin pull/{}/head`", p.head_commit, p.number, p.number)),
+        _ => e,
+    })?;
     let mut paths = Vec::new();
     for ch in &m.snapshot.changes {
         paths.push(PathCheck { path: ch.path.clone(), operation: ch.operation, state: git::check(root, &commit, ch)? });
@@ -759,13 +770,14 @@ fn bind_inner(ctx: &Ctx, audit_id: &str, rev: &str, assert: bool, record: bool) 
         verification: "local_git_inspection_unsigned".into(),
         provenance: if correspondence == Correspondence::Asserted { Provenance::SelfReported } else { Provenance::Derived },
         paths,
+        pull_request: pr,
     };
     let binding_id = body.binding_id()?;
     let stored = StoredBinding { binding_id: binding_id.clone(), body, created: Created { at: now(), clock_authority: "local_device_unverified".into() } };
     let created = if record { ctx.store.put_binding(&binding_id, &serde_json::to_vec_pretty(&stored)?)? } else { false };
     ok(json!({
         "binding_id": binding_id, "audit_id": audit_id, "duplicate": !created,
-        "git_commit": stored.body.git.commit, "commit_web_url": stored.body.git.commit_web_url,
+        "git_commit": stored.body.git.commit, "commit_web_url": stored.body.git.commit_web_url, "pull_request": stored.body.pull_request,
         "correspondence": correspondence, "paths_matched": matched, "paths_total": stored.body.paths.len(),
         "paths": stored.body.paths,
         "note": "web link is derived from the origin remote; it does not prove the commit was pushed",
@@ -787,9 +799,9 @@ pub fn bind_pending(ctx: &Ctx, rev: &str) -> Res<Out> {
         if bound.contains(&id) {
             continue;
         }
-        match bind_inner(ctx, &id, rev, false, false) {
+        match bind_inner(ctx, &id, rev, None, false, false) {
             Ok(Out { value, .. }) if value["correspondence"] == "full" => {
-                let done = bind_inner(ctx, &id, rev, false, true)?;
+                let done = bind_inner(ctx, &id, rev, None, false, true)?;
                 linked.push(json!({"audit_id": id, "correspondence": "full", "binding_id": done.value["binding_id"]}));
             }
             Ok(Out { value, .. }) => skipped.push(json!({"audit_id": id, "reason": format!("correspondence is {}; only full matches are linked automatically", value["correspondence"].as_str().unwrap_or("unknown"))})),

@@ -3,6 +3,7 @@ mod error;
 mod events;
 mod git;
 mod github;
+mod pr;
 mod project;
 mod snapshot;
 mod store;
@@ -40,10 +41,13 @@ enum Cmd {
         message: String,
     },
     Log,
+    #[command(group = clap::ArgGroup::new("target").required(true).multiple(false).args(["git_commit", "pr"]))]
     Bind {
         audit_id: String,
         #[arg(long = "git-commit")]
-        git_commit: String,
+        git_commit: Option<String>,
+        #[arg(long)]
+        pr: Option<String>,
         #[arg(long)]
         assert: bool,
     },
@@ -105,7 +109,7 @@ fn run(cli: &Cli) -> error::Res<Out> {
         Cmd::Gaps => commands::gaps(&ctx),
         Cmd::Commit { message } => commands::commit(&ctx, message),
         Cmd::Log => commands::log(&ctx),
-        Cmd::Bind { audit_id, git_commit, assert } => commands::bind(&ctx, audit_id, git_commit, *assert),
+        Cmd::Bind { audit_id, git_commit, pr, assert } => commands::bind(&ctx, audit_id, git_commit.as_deref(), pr.as_deref(), *assert),
         Cmd::BindPending { git_commit } => commands::bind_pending(&ctx, git_commit),
         Cmd::GitHook { op: GitHookOp::Install } => commands::git_hook_install(&ctx),
         Cmd::Bindings { audit_id } => commands::bindings(&ctx, audit_id.as_deref()),
