@@ -5,6 +5,7 @@ import { Badge, BulletList, CorrBadge, GithubLink, Kv, Message, ProvBadge } from
 import { useAsync } from "../hooks";
 import type { AuditDetail, Binding, Change, PathCheck } from "../types";
 import { Timeline } from "../Timeline";
+import { anchorFor } from "../timelineModel";
 import { short } from "../util";
 
 const OPERATION: Record<Change["operation"], string> = { add: "add", modify: "modify", delete: "delete", type_change: "type change" };
@@ -192,8 +193,6 @@ export function AuditView({ slug, d }: { slug: string; d: AuditDetail }) {
         <p className="muted small">The web link is derived from the origin remote and does not prove the commit was pushed.</p>
       </Card>
 
-      <Timeline groups={d.timeline} />
-
       <Card
         title={
           <>
@@ -238,7 +237,7 @@ export function AuditView({ slug, d }: { slug: string; d: AuditDetail }) {
               </tr>
             )}
             {s.changes.map((c) => (
-              <tr key={c.path}>
+              <tr key={c.path} id={anchorFor(c.path)}>
                 <td className="mono">{c.path}</td>
                 <td>{OPERATION[c.operation]}</td>
                 <td className="mono">{c.digest_after ? c.digest_after.slice(0, 19) : "—"}</td>
@@ -416,6 +415,8 @@ export function AuditView({ slug, d }: { slug: string; d: AuditDetail }) {
           </>
         )}
       </Card>
+
+      <Timeline groups={d.timeline} changedPaths={s.changes.map((c) => c.path)} />
     </>
   );
 }
