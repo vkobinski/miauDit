@@ -1,8 +1,10 @@
-# auditAI
+# miauDit
 
 **A system of record for AI-assisted software decisions, human approvals, and production provenance.**
 
-Status: product and architecture proposal. No implementation exists. Rust is the intended implementation language. The name is provisional and has not been checked for trademark or domain availability.
+Status: product and architecture proposal. No implementation exists. Rust is the intended implementation language.
+
+Implementation status: the first slice exists under `crates/` (see [crates/README.md](crates/README.md)): the offline local core of the CLI, without MCP, harness, server, policy engine, signatures or human approvals. The name is provisional and has not been checked for trademark or domain availability.
 
 Detailed design: [Evidence MCP and execution harness](docs/evidence-mcp-and-harness.md). This defines how agents submit structured decisions and how a Rust harness independently captures execution evidence.
 
@@ -14,7 +16,7 @@ Detailed interaction capture: [Prompts, responses, authorizations and review evi
 
 Banks, fintechs, and teams building critical software need to explain how a production change came into existence. A Git diff captures the result, but usually omits the instructions, source material, tool access, agent delegation, rejected alternatives, and human approvals that produced it.
 
-auditAI would provide a GitHub-like interface for this evidence. Every change would have an audit dossier linking agent activity to code, review, build artifacts, and deployment. Teams could answer:
+miauDit would provide a GitHub-like interface for this evidence. Every change would have an audit dossier linking agent activity to code, review, build artifacts, and deployment. Teams could answer:
 
 - Who requested the change, and what constraints did they give the AI?
 - Which agent sessions contributed, including delegated agents?
@@ -28,7 +30,7 @@ The initial product integrates with existing Git hosting rather than replacing i
 
 ## 2. Boundaries of the claim
 
-auditAI records observable actions and explicit decision records. It does not extract private model reasoning or claim to reconstruct an agent's internal thought process. An agent's explanation is attributed testimony, not independent proof of why it generated code.
+miauDit records observable actions and explicit decision records. It does not extract private model reasoning or claim to reconstruct an agent's internal thought process. An agent's explanation is attributed testimony, not independent proof of why it generated code.
 
 Observed file access does not prove that a model understood or used the file. A visible response does not prove that a developer read it. Tool permission does not prove actual access. A commit author is not automatically the requester, reviewer, or production approver.
 
@@ -52,7 +54,7 @@ The product establishes evidence of actions and assigned organizational responsi
 3. **Capture context and actions.** Supported adapters record developer messages, visible agent outputs, tool calls, file reads and writes, documentation references, MCP access, command results, and delegation relationships. Sensitive content is filtered before upload.
 4. **Record decisions.** The agent or developer proposes a structured decision containing alternatives, a concise rationale, supporting evidence, affected code, and risks. Developers explicitly accept, amend, reject, or defer material decisions.
 5. **Bind evidence to a commit.** Capture the final tree and patch digest, parent revision, working changes, sessions, and policy version. Register an immutable dossier referencing the resulting commit SHA. Store this externally to avoid a circular dependency between commit contents and its own SHA.
-6. **Review the pull request.** auditAI presents the code diff, decision records, evidence coverage, sensitive access, and policy results. An approval binds the approver's identity and role to an exact revision and dossier digest.
+6. **Review the pull request.** miauDit presents the code diff, decision records, evidence coverage, sensitive access, and policy results. An approval binds the approver's identity and role to an exact revision and dossier digest.
 7. **Re-evaluate changes.** New code, new material evidence, or a policy-relevant correction creates another dossier revision and invalidates affected approvals. Policies define when fresh review is mandatory.
 8. **Bind the build and release.** CI attests to source revision, build inputs, test results, and artifact digest. Deployment records bind that digest to an environment, release approval, and time.
 9. **Investigate or export.** An auditor opens a production release and follows verified links back to its decisions and evidence. Exports include a signed manifest, policy evaluations, redactions, and verification instructions.
@@ -107,7 +109,7 @@ Keep distinct roles: requester, session operator, decision owner, code author, r
 
 An acceptance must identify what the person accepted: a recommendation, a code revision, a documented risk, or a production release. Store identity, authentication method, server receipt time, statement, scope, and evidence digest. Never infer acceptance merely from continuing a chat, creating a commit, or clicking a generic tool permission prompt.
 
-Repository ownership defines responsibility assignments prospectively. auditAI records assignments and actions without generating developer blame scores. Break-glass releases require a named authorized actor, reason, scope, expiry, and retrospective review. Delegation does not silently transfer an approver's responsibility.
+Repository ownership defines responsibility assignments prospectively. miauDit records assignments and actions without generating developer blame scores. Break-glass releases require a named authorized actor, reason, scope, expiry, and retrospective review. Delegation does not silently transfer an approver's responsibility.
 
 ## 8. Integration strategy
 
@@ -201,7 +203,7 @@ Examples for a high-risk payments repository:
 - Approval must match the final reviewed revision; deployment must match the approved artifact digest.
 - Failed required checks prevent release; a summary saying “tests passed” is insufficient.
 
-auditAI publishes checks, but Git branch protection and deployment infrastructure enforce them. Policy changes and exceptions are themselves reviewed and audited. A green check means specified controls passed against available evidence, not that the code is secure or correct.
+miauDit publishes checks, but Git branch protection and deployment infrastructure enforce them. Policy changes and exceptions are themselves reviewed and audited. A green check means specified controls passed against available evidence, not that the code is secure or correct.
 
 ## 14. Product experience
 
