@@ -331,3 +331,47 @@ async fn a_superseded_decision_points_to_the_audit_that_replaces_it() {
     assert_eq!(second_detail["decisions"][0]["superseded_by"].as_array().unwrap().len(), 0);
     assert_eq!(second_detail["manifest"]["snapshot"]["changes"].as_array().unwrap().len(), 0);
 }
+
+fn hook_run(dir: &Path, bin: &str, sub: &str, payload: serde_json::Value) {
+    use std::io::Write;
+    let mut c = Command::new(bin).current_dir(dir).env("MIAUDIT_GITHUB_USER", "test-user").arg(sub).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    c.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+    assert!(c.wait().unwrap().success());
+}
+
+#[tokio::test]
+async fn the_conversation_timeline_lives_inside_one_audit_with_prompts_shown_locally() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path();
+    let bin = audit_bin();
+    let a = bin.to_str().unwrap();
+    run(p, a, &["init", "--no-hooks"]);
+    fs::write(p.join("f.txt"), "x").unwrap();
+    run(p, a, &["add", "f.txt"]);
+    let id = json(&run(p, a, &["--json", "commit", "-m", "the one audit"]))["result"]["audit_id"].as_str().unwrap().to_string();
+    let manifest_before = fs::read(p.join(format!(".miaudit/commits/{id}.json"))).unwrap();
+    for q in ["who owns the keys?", "and the rollout?"] {
+        hook_run(p, a, "capture", serde_json::json!({"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": p, "prompt": q}));
+        hook_run(p, a, "capture", serde_json::json!({"hook_event_name": "PostToolUse", "session_id": "s1", "cwd": p, "tool_name": "Bash", "tool_input": {"command": "kubectl get pods"}, "tool_response": {"stdout": "SECRET-OUTPUT", "exit_code": 0}}));
+        hook_run(p, a, "stop-check", serde_json::json!({"hook_event_name": "Stop", "session_id": "s1", "cwd": p, "stop_hook_active": false, "last_assistant_message": "done"}));
+    }
+    assert_eq!(fs::read(p.join(format!(".miaudit/commits/{id}.json"))).unwrap(), manifest_before, "the audit hash does not move");
+
+    let app = app(&d);
+    let slug = slug(&d);
+    let list = json(&get(&app, "GET", &format!("/{slug}/api/audits"), HOST).await.2);
+    assert_eq!((list["total"].as_u64(), list["audits"][0]["checkpoints"].as_u64()), (Some(1), Some(2)), "one audit, two checkpoints inside it");
+
+    let (_, _, body) = get(&app, "GET", &format!("/{slug}/api/audits/{id}/detail"), HOST).await;
+    assert!(!body.contains("SECRET-OUTPUT") && !body.contains("kubectl get pods"));
+    let detail = json(&body);
+    let groups: Vec<&serde_json::Value> = detail["timeline"].as_array().unwrap().iter().filter(|g| g["source"] == "checkpoint").collect();
+    assert_eq!(groups.len(), 2);
+    let prompts: Vec<&str> = groups.iter().map(|g| g["events"][0]["prompt_text"].as_str().unwrap()).collect();
+    assert_eq!(prompts, vec!["who owns the keys?", "and the rollout?"], "the local viewer reads prompt text from the local store");
+    assert_eq!(groups[0]["events"][1]["data"]["program"], "kubectl");
+    assert_eq!(groups[1]["summary"]["prompts"], 1);
+    assert_eq!(detail["verification"]["integrity"], "pass");
+    let checks: Vec<&str> = detail["verification"]["checks"].as_array().unwrap().iter().map(|c| c["check"].as_str().unwrap()).collect();
+    assert!(checks.contains(&"checkpoints_integrity"), "{checks:?}");
+}

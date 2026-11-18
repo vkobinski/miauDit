@@ -194,21 +194,24 @@ eq "viewer API flags the screenshot as an image" "$(curl -s "http://127.0.0.1:$P
 
 
 BEFORE=$($M log --json | python3 -c "import json,sys;print(len(json.load(sys.stdin)['result']['commits']))")
+HEADID=$($M log --json | python3 -c "import json,sys;print(json.load(sys.stdin)['result']['commits'][0]['audit_id'])")
+HEADBYTES=$(shasum -a 256 ".miaudit/commits/$HEADID.json")
 cap '{"hook_event_name":"UserPromptSubmit","session_id":"s2","prompt":"ask a question"}'
 cap "$(printf '{"hook_event_name":"PostToolUse","session_id":"s2","cwd":"%s","tool_name":"Bash","tool_input":{"command":"kubectl get pods"},"tool_response":{"stdout":"E2E-CHECKPOINT-SECRET","exit_code":0}}' "$W")"
-out=$(printf '{"hook_event_name":"Stop","session_id":"s2","last_assistant_message":"answer"}' | MIAUDIT_GITHUB_USER=e2e $M stop-check 2>&1 >/dev/null); rc=$?
-eq "stop-check exits 0 and records a checkpoint when a turn had only commands and conversation" $rc 0
-printf '%s' "$out" | grep -q "checkpoint audit_"; check "stop-check reports the checkpoint it recorded" $?
+out=$(printf '{"hook_event_name":"Stop","session_id":"s2","last_assistant_message":"answer"}' | $M stop-check 2>&1 >/dev/null); rc=$?
+eq "stop-check exits 0 and attaches a checkpoint when a turn had only commands and conversation" $rc 0
+printf '%s' "$out" | grep -q "checkpoint chk_"; check "stop-check reports the checkpoint it attached" $?
 AFTER=$($M log --json | python3 -c "import json,sys;print(len(json.load(sys.stdin)['result']['commits']))")
-eq "the checkpoint adds exactly one audit commit" "$AFTER" "$((BEFORE+1))"
-CPID=$($M log --json | python3 -c "import json,sys;print(json.load(sys.stdin)['result']['commits'][0]['audit_id'])")
-$M show "$CPID" --json | grep -q "AUTO_CHECKPOINT"; check "the checkpoint carries the AUTO_CHECKPOINT gap" $?
-$M verify "$CPID" --json >/dev/null; eq "the checkpoint verifies" $? 0
+eq "the checkpoint creates no new audit commit" "$AFTER" "$BEFORE"
+eq "the audit commit file, and so its hash, is unchanged" "$(shasum -a 256 ".miaudit/commits/$HEADID.json")" "$HEADBYTES"
+eq "the audit now has one checkpoint inside it" "$($M show "$HEADID" --json | python3 -c "import json,sys;print(len(json.load(sys.stdin)['result']['checkpoints']))")" 1
+$M verify "$HEADID" --json > verify-cp.out; eq "the audit with its checkpoint verifies" $? 0
+$M verify "$HEADID" --json | grep -q "checkpoints_integrity"; check "verify reports the checkpoints_integrity check" $?
 grep -rq "E2E-CHECKPOINT-SECRET\|kubectl get pods" .miaudit/blobs; [ $? -ne 0 ]; check "the checkpoint stores no command text or output" $?
 $M checkpoints off --json >/dev/null
 cap '{"hook_event_name":"UserPromptSubmit","session_id":"s2","prompt":"another"}'
 printf '{"hook_event_name":"Stop","session_id":"s2"}' | $M stop-check >/dev/null 2>&1
-eq "no checkpoint is recorded while checkpoints are off" "$($M log --json | python3 -c "import json,sys;print(len(json.load(sys.stdin)['result']['commits']))")" "$AFTER"
+eq "no checkpoint is attached while checkpoints are off" "$($M show "$HEADID" --json | python3 -c "import json,sys;print(len(json.load(sys.stdin)['result']['checkpoints']))")" 1
 $M checkpoints on --json >/dev/null
 
 if [ -n "${MIAUDIT_TEST_MONGO_URI:-}" ] && [ -x "$SRV" ]; then

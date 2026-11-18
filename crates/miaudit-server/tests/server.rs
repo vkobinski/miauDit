@@ -151,7 +151,7 @@ async fn push_then_browse_like_github() {
 
     let (again, code) = push(&f, &live, &live.token, None);
     assert_eq!(code, 0);
-    assert_eq!(again["result"]["sent"], serde_json::json!({"blobs": 0, "objects": 0, "commits": 0, "bindings": 0}), "second push must send nothing");
+    assert_eq!(again["result"]["sent"], serde_json::json!({"blobs": 0, "objects": 0, "commits": 0, "bindings": 0, "checkpoints": 0}), "second push must send nothing");
     assert_eq!(again["result"]["already_on_server"]["commits"], 1);
 
     let app = app(&db);
@@ -474,4 +474,89 @@ async fn a_superseded_decision_is_reported_including_for_audits_stored_before_th
     database.collection::<mongodb::bson::Document>("objects").update_many(mongodb::bson::doc! {}, mongodb::bson::doc! {"$unset": {"supersedes": ""}}).await.unwrap();
     let reopened = Db::connect(&uri, &name).await.unwrap();
     check(app(&reopened)).await;
+}
+
+fn hook(dir: &Path, sub: &str, payload: Value) -> i32 {
+    use std::io::Write;
+    let bin = miaudit_bin();
+    let mut c = Command::new(bin).current_dir(dir).env("MIAUDIT_GITHUB_USER", "test-user").arg(sub).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    c.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+    c.wait().unwrap().code().unwrap()
+}
+
+fn turn(dir: &Path, question: &str) {
+    assert_eq!(hook(dir, "capture", serde_json::json!({"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": dir, "prompt": question})), 0);
+    assert_eq!(hook(dir, "capture", serde_json::json!({"hook_event_name": "PostToolUse", "session_id": "s1", "cwd": dir, "tool_name": "Bash", "tool_input": {"command": "kubectl get pods"}, "tool_response": {"stdout": "SECRET-OUTPUT", "exit_code": 0}})), 0);
+    assert_eq!(hook(dir, "stop-check", serde_json::json!({"hook_event_name": "Stop", "session_id": "s1", "cwd": dir, "stop_hook_active": false, "last_assistant_message": "done"})), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoints_are_pushed_attached_to_the_audit_and_shown_as_a_timeline() {
+    let Some(db) = test_db().await else { return };
+    let live = serve(&db, None).await;
+    let f = fixture("git@github.com:acme/talk.git", "talk audit");
+    let local_manifest = fs::read(f.dir.path().join(".miaudit/commits").join(format!("{}.json", f.audit_id))).unwrap();
+    turn(f.dir.path(), "who owns the keys?");
+    turn(f.dir.path(), "and the rollout?");
+
+    let (out, code) = push(&f, &live, &live.token, None);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["result"]["sent"]["checkpoints"], 2, "{out}");
+    let (again, _) = push(&f, &live, &live.token, None);
+    assert_eq!(again["result"]["sent"]["checkpoints"], 0, "a second push sends nothing");
+    assert_eq!(again["result"]["already_on_server"]["checkpoints"], 2);
+
+    let app = app(&db);
+    let (_, _, raw) = get(&app, &format!("/acme/talk/api/audits/{}", f.audit_id), None).await;
+    assert_eq!(raw, local_manifest, "the audit commit and its hash are exactly what was committed; checkpoints do not alter it");
+
+    let (_, _, body) = get(&app, "/acme/talk/api/audits", None).await;
+    let list: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list["total"], 1, "no extra audit commits");
+    assert_eq!(list["audits"][0]["checkpoints"], 2);
+
+    let (s, _, body) = get(&app, &format!("/acme/talk/api/audits/{}/detail", f.audit_id), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(!text.contains("SECRET-OUTPUT") && !text.contains("kubectl get pods"), "only digests travel");
+    let d: Value = serde_json::from_slice(&body).unwrap();
+    let groups: Vec<&Value> = d["timeline"].as_array().unwrap().iter().filter(|g| g["source"] == "checkpoint").collect();
+    assert_eq!(groups.len(), 2);
+    for g in &groups {
+        assert_eq!(g["state"], "present");
+        let kinds: Vec<&str> = g["events"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["user_prompt", "command", "assistant_message"], "{kinds:?}");
+        assert_eq!(g["summary"]["commands"], 1);
+        assert!(g["events"][0].get("prompt_text").is_none(), "prompt text stays on the developer's machine");
+    }
+    assert_eq!(d["verification"]["integrity"], "pass");
+    let checks: Vec<&str> = d["verification"]["checks"].as_array().unwrap().iter().map(|c| c["check"].as_str().unwrap()).collect();
+    assert!(checks.contains(&"events_available"), "{checks:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_refuses_checkpoints_that_do_not_hash_or_have_no_audit() {
+    let Some(db) = test_db().await else { return };
+    let live = serve(&db, None).await;
+    let f = fixture("git@github.com:acme/talk2.git", "talk audit");
+    turn(f.dir.path(), "q");
+    assert_eq!(push(&f, &live, &live.token, None).1, 0);
+    let repo_id = serde_json::from_str::<Value>(&fs::read_to_string(f.dir.path().join(".miaudit/config.json")).unwrap()).unwrap()["repo_id"].as_str().unwrap().to_string();
+    let dir = f.dir.path().join(".miaudit/checkpoints");
+    let file = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+    let id = file.file_stem().unwrap().to_str().unwrap().to_string();
+    let good = fs::read_to_string(&file).unwrap();
+
+    let (code, v) = raw_put(&live, &live.token, &format!("/api/v1/repos/{repo_id}/checkpoints/{id}"), good.replace("\"prompts\": 1", "\"prompts\": 9").into_bytes()).await;
+    assert_eq!((code, v["error"]["code"].as_str()), (422, Some("ID_MISMATCH")));
+    let (code, v) = raw_put(&live, &live.token, &format!("/api/v1/repos/{repo_id}/checkpoints/chk_nothex"), good.clone().into_bytes()).await;
+    assert_eq!((code, v["error"]["code"].as_str()), (422, Some("BAD_ID")));
+    let (code, v) = raw_put(&live, &live.token, &format!("/api/v1/repos/{repo_id}/checkpoints/{id}"), good.clone().into_bytes()).await;
+    assert_eq!((code, v["stored"].as_bool()), (200, Some(false)), "re-sending the same checkpoint is a no-op");
+
+    let other = format!("repo_{}", "d".repeat(32));
+    let (code, _) = raw_put(&live, &live.token, &format!("/api/v1/repos/{other}"), br#"{"slug":"x/other","remote_url":null}"#.to_vec()).await;
+    assert_eq!(code, 200);
+    let (code, v) = raw_put(&live, &live.token, &format!("/api/v1/repos/{other}/checkpoints/{id}"), good.into_bytes()).await;
+    assert_eq!((code, v["error"]["code"].as_str()), (409, Some("CONFLICT")), "a checkpoint cannot be filed in a repository that lacks its audit commit");
 }

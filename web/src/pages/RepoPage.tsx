@@ -56,7 +56,7 @@ export function RepoPage() {
                     <Link to={`/${slug}/audit/${a.audit_id}`}>{a.description}</Link>
                   </div>
                   <div className="m">
-                    {a.author ? `@${a.author}` : "author not recorded"} · <span title={a.created_at}>{ago(a.created_at)}</span> · {plural(a.changes, "change")} · {a.gaps === 0 ? "no gaps" : plural(a.gaps, "gap")}
+                    {a.author ? `@${a.author}` : "author not recorded"} · <span title={a.created_at}>{ago(a.created_at)}</span> · {plural(a.changes, "change")} · {a.gaps === 0 ? "no gaps" : plural(a.gaps, "gap")}{a.checkpoints > 0 && <> · {plural(a.checkpoints, "checkpoint")}</>}
                   </div>
                 </div>
                 <div className="r">

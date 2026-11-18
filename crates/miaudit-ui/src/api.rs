@@ -9,6 +9,7 @@ pub struct RowFields<'a> {
     pub author: Option<&'a str>,
     pub changes: i64,
     pub gaps: i64,
+    pub checkpoints: i64,
     pub gap_codes: &'a [String],
     pub parents: &'a [String],
 }
@@ -32,7 +33,7 @@ pub fn git_links(bindings: &[StoredBinding], audit_id: &str) -> Vec<Value> {
 pub fn audit_row(f: &RowFields, git: Vec<Value>) -> Value {
     json!({
         "audit_id": f.audit_id, "created_at": f.created_at, "description": f.description, "author": f.author,
-        "changes": f.changes, "gaps": f.gaps, "gap_codes": f.gap_codes, "parents": f.parents, "git": git,
+        "changes": f.changes, "gaps": f.gaps, "checkpoints": f.checkpoints, "gap_codes": f.gap_codes, "parents": f.parents, "git": git,
     })
 }
 
@@ -70,5 +71,6 @@ pub fn detail_json(v: &View, ver: &Verification, superseded: &Superseded) -> Val
         })).collect::<Vec<_>>(),
         "evidence": v.evidence.iter().map(|e| json!({"id": e.id, "object": e.object, "preview": e.preview, "artifact_state": e.artifact_state, "image": e.image})).collect::<Vec<_>>(),
         "verification": verification,
+        "timeline": v.timeline.iter().map(|g| json!({"source": g.source, "id": g.id, "created_at": g.created_at, "summary": g.summary, "state": g.state, "events": g.events, "truncated": g.truncated})).collect::<Vec<_>>(),
     })
 }

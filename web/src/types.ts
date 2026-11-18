@@ -43,6 +43,7 @@ export interface AuditRow {
   author: string | null;
   changes: number;
   gaps: number;
+  checkpoints: number;
   gap_codes: string[];
   parents: string[];
   git: GitLink[];
@@ -160,6 +161,35 @@ export type Verification =
   | { state: "result"; integrity: string; checks: { check: string; result: string; detail: string }[] }
   | { state: "unavailable"; reason: string };
 
+export interface TimelineEvent {
+  id: string;
+  seq: number;
+  at: string;
+  kind: string;
+  tool: string | null;
+  session_id: string | null;
+  data: Record<string, unknown>;
+  prompt_text?: string;
+}
+
+export interface TimelineSummary {
+  prompts: number;
+  assistant_messages: number;
+  commands: number;
+  resources: number;
+  agent_events: number;
+}
+
+export interface TimelineGroup {
+  source: "audit" | "checkpoint";
+  id: string;
+  created_at: string | null;
+  summary: TimelineSummary | null;
+  state: string;
+  events: TimelineEvent[];
+  truncated: boolean;
+}
+
 export interface AuditDetail {
   audit_id: string;
   manifest: Manifest;
@@ -168,6 +198,7 @@ export interface AuditDetail {
   decisions: DecisionItem[];
   evidence: EvidenceItem[];
   verification: Verification;
+  timeline: TimelineGroup[];
 }
 
 export interface AppConfig {

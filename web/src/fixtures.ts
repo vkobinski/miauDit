@@ -61,6 +61,7 @@ export function detail(overrides: Partial<AuditDetail> = {}): AuditDetail {
       { id: `evd_${"8".repeat(64)}`, object: null, preview: null, artifact_state: "object unavailable", image: false },
     ],
     verification: { state: "result", integrity: "pass", checks: [{ check: "tree_digest", result: "pass", detail: "ok" }] },
+    timeline: [],
     ...overrides,
   };
 }

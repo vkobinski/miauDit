@@ -1,7 +1,7 @@
 
 use miaudit_schema::{
     input::{ContextInput, DecisionInput},
-    model::{EvidenceBody, Manifest, Stored, StoredBinding},
+    model::{EvidenceBody, Manifest, Provenance, Stored, StoredBinding, StoredCheckpoint},
 };
 use serde_json::Value;
 use std::{fs, path::{Path, PathBuf}, process::Command};
@@ -21,6 +21,7 @@ pub struct Summary {
 }
 
 pub struct Repo {
+    pub checkpoints: Vec<StoredCheckpoint>,
     pub dir: PathBuf,
     pub root: PathBuf,
     pub summaries: Vec<Summary>,
@@ -42,7 +43,35 @@ pub struct EvidenceView {
     pub image: bool,
 }
 
+pub struct TimelineGroup {
+    pub source: &'static str,
+    pub id: String,
+    pub created_at: Option<String>,
+    pub summary: Option<Value>,
+    pub state: &'static str,
+    pub events: Vec<Value>,
+    pub truncated: bool,
+}
+
+pub const MAX_TIMELINE_EVENTS: usize = 3000;
+
+pub fn events_of(bytes: &[u8]) -> (Vec<Value>, bool) {
+    let mut out = Vec::new();
+    let mut truncated = false;
+    for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
+        if out.len() >= MAX_TIMELINE_EVENTS {
+            truncated = true;
+            break;
+        }
+        let b = &v["body"];
+        out.push(serde_json::json!({"id": v["id"], "seq": b["seq"], "at": b["at"], "kind": b["kind"], "tool": b["tool"], "session_id": b["session_id"], "data": b["data"]}));
+    }
+    (out, truncated)
+}
+
 pub struct View {
+    pub timeline: Vec<TimelineGroup>,
     pub id: String,
     pub manifest: Manifest,
     pub bindings: Vec<StoredBinding>,
@@ -79,7 +108,38 @@ impl Repo {
             }
         }
         summaries.sort_by(|a, b| b.manifest.created.at.cmp(&a.manifest.created.at).then(a.id.cmp(&b.id)));
-        Ok(Repo { dir, root: root.to_path_buf(), summaries, unreadable })
+        let mut checkpoints: Vec<StoredCheckpoint> = fs::read_dir(dir.join("checkpoints")).into_iter().flatten().flatten().filter_map(|e| read_json(&e.path())).collect();
+        checkpoints.sort_by(|a, b| (a.created.at.as_str(), a.body.first_seq).cmp(&(b.created.at.as_str(), b.body.first_seq)));
+        Ok(Repo { checkpoints, dir, root: root.to_path_buf(), summaries, unreadable })
+    }
+
+    pub fn checkpoint_count(&self, audit_id: &str) -> usize {
+        self.checkpoints.iter().filter(|c| c.body.audit_id == audit_id).count()
+    }
+
+    fn blob(&self, digest: &str) -> Option<Vec<u8>> {
+        let hex = digest.strip_prefix("sha256:")?;
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let bytes = fs::read(self.dir.join("blobs").join(hex)).ok()?;
+        (miaudit_schema::digest::content_id(&bytes) == digest).then_some(bytes)
+    }
+
+    fn group(&self, source: &'static str, id: String, created_at: Option<String>, summary: Option<Value>, digest: &str) -> TimelineGroup {
+        match self.blob(digest) {
+            Some(bytes) => {
+                let (mut events, truncated) = events_of(&bytes);
+                for e in events.iter_mut().filter(|e| e["kind"] == "user_prompt") {
+                    let text = e["data"]["prompt_blob"].as_str().and_then(|d| self.blob(d)).map(|b| String::from_utf8_lossy(&b[..b.len().min(4000)]).to_string());
+                    if let Some(t) = text {
+                        e["prompt_text"] = Value::String(t);
+                    }
+                }
+                TimelineGroup { source, id, created_at, summary, state: "present", events, truncated }
+            }
+            None => TimelineGroup { source, id, created_at, summary, state: "events unavailable", events: vec![], truncated: false },
+        }
     }
 
     pub fn repo_id(&self) -> Option<String> {
@@ -133,7 +193,7 @@ impl Repo {
     pub fn load(&self, id: &str) -> Option<View> {
         let s = self.summaries.iter().find(|s| s.id == id)?;
         let m = &s.manifest;
-        let evidence = m.evidence_ids.iter().map(|eid| {
+        let evidence: Vec<EvidenceView> = m.evidence_ids.iter().map(|eid| {
             let object: Option<Stored<EvidenceBody>> = self.object("evidence", eid);
             let (mut preview, mut state, mut image) = (None, "object unavailable", false);
             if let Some(o) = &object {
@@ -156,7 +216,17 @@ impl Repo {
             }
             EvidenceView { id: eid.clone(), object, preview, artifact_state: state, image }
         }).collect();
+        let mut timeline: Vec<TimelineGroup> = Vec::new();
+        for e in &evidence {
+            if let Some(o) = e.object.as_ref().filter(|o| o.provenance == Provenance::Observed) {
+                timeline.push(self.group("audit", e.id.clone(), Some(m.created.at.clone()), None, &o.body.artifact.digest));
+            }
+        }
+        for c in self.checkpoints.iter().filter(|c| c.body.audit_id == id) {
+            timeline.push(self.group("checkpoint", c.checkpoint_id.clone(), Some(c.created.at.clone()), serde_json::to_value(&c.body.summary).ok(), &c.body.events_blob));
+        }
         Some(View {
+            timeline,
             id: id.into(),
             manifest: m.clone(),
             bindings: s.bindings.clone(),

@@ -4,6 +4,7 @@ import { api } from "../api";
 import { Badge, BulletList, CorrBadge, GithubLink, Kv, Message, ProvBadge } from "../components";
 import { useAsync } from "../hooks";
 import type { AuditDetail, Binding, Change, PathCheck } from "../types";
+import { Timeline } from "../Timeline";
 import { short } from "../util";
 
 const OPERATION: Record<Change["operation"], string> = { add: "add", modify: "modify", delete: "delete", type_change: "type change" };
@@ -190,6 +191,8 @@ export function AuditView({ slug, d }: { slug: string; d: AuditDetail }) {
         )}
         <p className="muted small">The web link is derived from the origin remote and does not prove the commit was pushed.</p>
       </Card>
+
+      <Timeline groups={d.timeline} />
 
       <Card
         title={

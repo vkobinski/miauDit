@@ -318,7 +318,7 @@ fn unavailable_gap_message(cap: &str, obs: &Observed, after_checkpoint: bool) ->
         return format!("not recorded: the hook event log failed its integrity check ({e}), so none of its events were used; see EVENT_CHAIN_BROKEN");
     }
     if obs.events.is_empty() && after_checkpoint {
-        return "not recorded in this audit commit: no hook events exist since the last audit commit, which is an automatic checkpoint; the events of the preceding turns are in that checkpoint".into();
+        return "not recorded in this audit commit: no hook events exist since the last audit commit; the events of the preceding turns are attached to that audit commit as checkpoints".into();
     }
     if obs.events.is_empty() {
         return "not recorded: no hook events exist since the last audit commit; the Claude Code or Codex hooks are not installed in this repository or did not fire (check `miaudit events` and the hooks in .claude/settings.json)".into();
@@ -507,7 +507,7 @@ fn compute_gaps(ctx: &Ctx, p: &Pending, git: &GitBaseline) -> Res<Vec<Gap>> {
     g.extend(evidence_gaps(ctx, p)?);
     g.extend(observed_gaps(ctx, &observed(ctx))?);
     let obs_now = observed(ctx);
-    let after_checkpoint = ctx.store.head().ok().flatten().and_then(|h| ctx.store.get_commit(&h).ok().flatten()).is_some_and(|m| m.gaps.iter().any(|g| g.code == "AUTO_CHECKPOINT"));
+    let after_checkpoint = ctx.store.head().ok().flatten().is_some_and(|h| ctx.store.list_checkpoints().is_ok_and(|l| l.iter().any(|c| c.body.audit_id == h)));
     for cap in UNAVAILABLE_CAPABILITIES {
         match partial_note(cap, &obs_now.summary).filter(|_| obs_now.chain_error.is_none()) {
             Some(note) => g.push(gap(&format!("CAPTURE_PARTIAL:{cap}"), &note, vec![cap.into()])),
@@ -523,10 +523,6 @@ pub fn gaps(ctx: &Ctx) -> Res<Out> {
     ok(json!({"gaps": compute_gaps(ctx, &p, &git_baseline(&ctx.store.root))?}))
 }
 
-pub fn commit(ctx: &Ctx, message: &str) -> Res<Out> {
-    commit_with(ctx, message, false)
-}
-
 fn checkpoints_enabled(ctx: &Ctx) -> bool {
     if std::env::var("MIAUDIT_CHECKPOINT").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no")) {
         return false;
@@ -534,29 +530,11 @@ fn checkpoints_enabled(ctx: &Ctx) -> bool {
     ctx.store.config().map(|c| c.checkpoints != Some(false)).unwrap_or(true)
 }
 
-fn checkpoint_message(s: &events::Summary, total: usize) -> String {
-    let parts: Vec<String> = [
-        (s.prompts, "prompt"),
-        (s.assistant_messages, "assistant message digest"),
-        (s.commands, "command"),
-        (s.resources, "resource access"),
-        (s.agent_events, "agent event"),
-    ]
-    .iter()
-    .filter(|(n, _)| *n > 0)
-    .map(|(n, label)| format!("{n} {label}{}", if *n == 1 { "" } else { "s" }))
-    .collect();
-    if parts.is_empty() {
-        format!("checkpoint: {total} hook event(s) since the last audit commit")
-    } else {
-        format!("checkpoint: {} since the last audit commit", parts.join(", "))
-    }
-}
-
 pub fn checkpoint(ctx: &Ctx) -> Res<Option<Out>> {
     if !checkpoints_enabled(ctx) {
         return Ok(None);
     }
+    let Some(head) = ctx.store.head()? else { return Ok(None) };
     let obs = observed(ctx);
     if obs.chain_error.is_some() || obs.events.is_empty() || !obs.summary.last_digest.is_empty() {
         return Ok(None);
@@ -566,8 +544,30 @@ pub fn checkpoint(ctx: &Ctx) -> Res<Option<Out>> {
     if !diff_trees(&base, &cur).is_empty() || !pending.contexts.is_empty() || !pending.decisions.is_empty() || !pending.evidence.is_empty() {
         return Ok(None);
     }
-    let message = checkpoint_message(&obs.summary, obs.events.len());
-    commit_with(ctx, &message, true).map(Some)
+    let bytes = events::blob_of(&obs.events)?;
+    let events_blob = ctx.store.put_blob(&bytes)?;
+    let (first, last) = (obs.events.first().unwrap(), obs.events.last().unwrap());
+    let previous = ctx.store.list_checkpoints()?.into_iter().rfind(|c| c.body.audit_id == head).map(|c| c.checkpoint_id);
+    let s = &obs.summary;
+    let body = CheckpointBody {
+        schema_version: SCHEMA_VERSION.into(),
+        kind: "checkpoint".into(),
+        audit_id: head.clone(),
+        previous,
+        events_blob,
+        events_count: obs.events.len() as u64,
+        first_seq: first.body.seq,
+        last_seq: last.body.seq,
+        first_prev: first.body.prev.clone(),
+        last_event: last.id.clone(),
+        summary: CheckpointSummary { prompts: s.prompts as u64, assistant_messages: s.assistant_messages as u64, commands: s.commands as u64, resources: s.resources as u64, agent_events: s.agent_events as u64 },
+        provenance: Provenance::Observed,
+    };
+    let id = body.checkpoint_id()?;
+    let stored = StoredCheckpoint { checkpoint_id: id.clone(), body, created: Created { at: now(), clock_authority: "local_device_unverified".into() } };
+    ctx.store.put_checkpoint(&id, &serde_json::to_vec_pretty(&stored)?)?;
+    Log::new(&ctx.store).set_cursor(last.body.seq)?;
+    ok(json!({"checkpoint_id": id, "audit_id": head, "events": obs.events.len(), "summary": stored.body.summary, "note": "attached to the audit commit as an attestation; the audit id did not change"})).map(Some)
 }
 
 pub fn checkpoints_setting(ctx: &Ctx, state: Option<&str>) -> Res<Out> {
@@ -586,17 +586,17 @@ pub fn checkpoints_setting(ctx: &Ctx, state: Option<&str>) -> Res<Out> {
         "checkpoints": checkpoints_enabled(ctx),
         "stored_setting": if config.checkpoints == Some(false) { "off" } else { "on (default)" },
         "disabled_by_environment": env_off,
-        "note": "at each Stop the hook records an observed-only checkpoint audit when hook events exist, nothing is staged or pending, and no edited file is waiting to be audited; MIAUDIT_CHECKPOINT=0 disables it for one run",
+        "note": "at each Stop the hook attaches an observed-only checkpoint to the latest audit commit when hook events exist, nothing is staged or pending, and no edited file is waiting to be audited; the audit id never changes; MIAUDIT_CHECKPOINT=0 disables it for one run",
     }))
 }
 
-fn commit_with(ctx: &Ctx, message: &str, automatic: bool) -> Res<Out> {
+pub fn commit(ctx: &Ctx, message: &str) -> Res<Out> {
     if message.trim().is_empty() || message.chars().count() > 512 {
         return Err(CliError::validation("SCHEMA_VIOLATION", "message must be 1-512 characters").field("/message"));
     }
     let (base, cur) = ctx.current()?;
     let pending = ctx.store.pending()?;
-    if diff_trees(&base, &cur).is_empty() && pending.contexts.is_empty() && pending.decisions.is_empty() && pending.evidence.is_empty() && !automatic {
+    if diff_trees(&base, &cur).is_empty() && pending.contexts.is_empty() && pending.decisions.is_empty() && pending.evidence.is_empty() {
         return Err(CliError::validation("NOTHING_STAGED", "no staged changes and no pending context, decisions or evidence"));
     }
     let td = tree_digest(&cur)?;
@@ -611,11 +611,8 @@ fn commit_with(ctx: &Ctx, message: &str, automatic: bool) -> Res<Out> {
     }
     let git = git_baseline(&ctx.store.root);
     let config = ctx.store.config()?;
-    let author = if automatic { github::resolve_author_without_network() } else { github::resolve_author() };
+    let author = github::resolve_author();
     let obs = observed(ctx);
-    if automatic && (obs.events.is_empty() || obs.chain_error.is_some()) {
-        return Err(CliError::validation("NOTHING_STAGED", "no observed events to checkpoint"));
-    }
     let mut evidence_ids = pending.evidence.clone();
     let mut last_seq = None;
     if !obs.events.is_empty() && obs.chain_error.is_none() {
@@ -666,9 +663,6 @@ fn commit_with(ctx: &Ctx, message: &str, automatic: bool) -> Res<Out> {
         coverage: coverage(&obs),
         gaps: {
             let mut g = compute_gaps(ctx, &pending, &git)?;
-            if automatic {
-                g.push(gap("AUTO_CHECKPOINT", "recorded automatically by the Stop hook: it holds hook-observed event receipts only, no context, decisions or claims written by the agent", vec![]));
-            }
             match author.provenance {
                 Provenance::Unavailable => g.push(gap("AUTHOR_UNAVAILABLE", &format!("no GitHub user could be recorded: {}", author.verification), vec![])),
                 Provenance::SelfReported => g.push(gap("AUTHOR_ASSERTED", "the GitHub user comes from MIAUDIT_GITHUB_USER and was not authenticated", vec![])),
@@ -686,7 +680,7 @@ fn commit_with(ctx: &Ctx, message: &str, automatic: bool) -> Res<Out> {
     ctx.store.save_index(&Default::default())?;
     ctx.store.save_pending(&Default::default())?;
     ok(json!({
-        "audit_id": id, "snapshot_id": sid, "automatic": automatic,
+        "audit_id": id, "snapshot_id": sid,
         "accepted": true, "verified": false, "policy_passed": "not_evaluated", "human_approved": false,
         "gaps": manifest.gaps.len(), "note": "an audit commit preserves history; it does not imply policy success or approval",
     }))
@@ -696,6 +690,7 @@ pub fn log(ctx: &Ctx) -> Res<Out> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     let bindings = ctx.store.list_bindings()?;
+    let checkpoints = ctx.store.list_checkpoints()?;
     let mut queue: Vec<String> = ctx.store.head()?.into_iter().collect();
     while let Some(id) = queue.pop() {
         if !seen.insert(id.clone()) {
@@ -705,7 +700,7 @@ pub fn log(ctx: &Ctx) -> Res<Out> {
             Some(m) => {
                 queue.extend(m.parents.iter().cloned());
                 let linked: Vec<Value> = bindings.iter().filter(|b| b.body.audit_id == id).map(|b| json!({"git_commit": b.body.git.commit, "correspondence": b.body.correspondence})).collect();
-                out.push(json!({"audit_id": id, "created_at": m.created.at, "author": m.author.as_ref().and_then(|a| a.github_login.clone()), "description": m.description, "parents": m.parents, "git": linked}));
+                out.push(json!({"audit_id": id, "created_at": m.created.at, "author": m.author.as_ref().and_then(|a| a.github_login.clone()), "description": m.description, "parents": m.parents, "git": linked, "checkpoints": checkpoints.iter().filter(|c| c.body.audit_id == id).count()}));
             }
             None => out.push(json!({"audit_id": id, "state": "unavailable_locally"})),
         }
@@ -722,7 +717,8 @@ pub fn show(ctx: &Ctx, id: &str) -> Res<Out> {
         }).collect()
     };
     let bindings: Vec<_> = ctx.store.list_bindings()?.into_iter().filter(|b| b.body.audit_id == id).collect();
-    ok(json!({"audit_id": id, "manifest": m, "git_bindings": bindings,
+    let checkpoints: Vec<_> = ctx.store.list_checkpoints()?.into_iter().filter(|c| c.body.audit_id == id).collect();
+    ok(json!({"audit_id": id, "manifest": m, "git_bindings": bindings, "checkpoints": checkpoints,
         "objects": {"contexts": load(&m.context_ids), "decisions": load(&m.decision_ids), "evidence": load(&m.evidence_ids)}}))
 }
 
@@ -822,11 +818,60 @@ pub fn verify(ctx: &Ctx, id: &str) -> Res<Out> {
     } else {
         note(&mut checks, "git_bindings_integrity", Level::Fail, format!("altered binding(s): {bad_bindings:?}"));
     }
+    let cps: Vec<StoredCheckpoint> = ctx.store.list_checkpoints()?.into_iter().filter(|c| c.body.audit_id == id).collect();
+    if !cps.is_empty() {
+        let (mut bad, mut missing, mut total) = (Vec::<String>::new(), 0usize, 0usize);
+        let (mut prev_id, mut prev_last): (Option<String>, Option<String>) = (None, None);
+        for c in &cps {
+            if c.body.checkpoint_id().ok().as_deref() != Some(c.checkpoint_id.as_str()) {
+                bad.push(format!("{}: id does not match content", c.checkpoint_id));
+                continue;
+            }
+            if c.body.previous != prev_id {
+                bad.push(format!("{}: previous link is {:?}, expected {:?}", c.checkpoint_id, c.body.previous, prev_id));
+            }
+            match ctx.store.get_blob(&c.body.events_blob)? {
+                None => missing += 1,
+                Some(b) => match events::parse_chain(&b, events::Anchor::Any) {
+                    Ok(list) => {
+                        let first = list.first();
+                        let last = list.last();
+                        let matches = list.len() as u64 == c.body.events_count
+                            && first.map(|e| e.body.seq) == Some(c.body.first_seq)
+                            && first.and_then(|e| e.body.prev.clone()) == c.body.first_prev
+                            && last.map(|e| (e.body.seq, e.id.as_str())) == Some((c.body.last_seq, c.body.last_event.as_str()));
+                        if !matches {
+                            bad.push(format!("{}: the events do not match the checkpoint record", c.checkpoint_id));
+                        }
+                        if let Some(p) = &prev_last
+                            && c.body.first_prev.as_deref() != Some(p.as_str())
+                        {
+                            bad.push(format!("{}: the event chain has a gap since the previous checkpoint", c.checkpoint_id));
+                        }
+                        total += list.len();
+                    }
+                    Err(why) => bad.push(format!("{}: {why}", c.checkpoint_id)),
+                },
+            }
+            prev_id = Some(c.checkpoint_id.clone());
+            prev_last = Some(c.body.last_event.clone());
+        }
+        if !bad.is_empty() {
+            note(&mut checks, "checkpoints_integrity", Level::Fail, format!("{bad:?}"));
+        } else if missing > 0 {
+            note(&mut checks, "checkpoints_integrity", Level::Partial, format!("{missing} checkpoint event blob(s) unavailable"));
+        } else {
+            note(&mut checks, "checkpoints_integrity", Level::Pass, format!("{} checkpoint(s), {total} event(s): ids match content, chains are valid and contiguous", cps.len()));
+        }
+    }
     let mut blobs: BTreeSet<String> = m.snapshot.entries.iter().map(|e| e.digest.clone()).collect();
     for e in &m.evidence_ids {
         if let Some(ev) = ctx.store.get_evidence(e)? {
             blobs.insert(ev.body.artifact.digest);
         }
+    }
+    for c in &cps {
+        blobs.insert(c.body.events_blob.clone());
     }
     let (mut missing, mut bad) = (vec![], vec![]);
     for d in &blobs {

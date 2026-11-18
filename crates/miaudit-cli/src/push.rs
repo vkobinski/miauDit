@@ -104,6 +104,11 @@ pub fn push(ctx: &Ctx, server: Option<&str>, name: Option<&str>) -> Res<Out> {
     }
     let bindings = ctx.store.list_bindings()?;
     let binding_ids: Vec<String> = bindings.iter().map(|b| b.binding_id.clone()).collect();
+    let checkpoints = ctx.store.list_checkpoints()?;
+    let checkpoint_ids: Vec<String> = checkpoints.iter().map(|c| c.checkpoint_id.clone()).collect();
+    for c in &checkpoints {
+        blob_digests.insert(c.body.events_blob.clone());
+    }
 
     client.send("PUT", &format!("/api/v1/repos/{}", config.repo_id), "application/json", &serde_json::to_vec(&json!({"slug": slug, "remote_url": remote}))?)?;
 
@@ -112,15 +117,15 @@ pub fn push(ctx: &Ctx, server: Option<&str>, name: Option<&str>) -> Res<Out> {
         &format!("/api/v1/repos/{}/have", config.repo_id),
         "application/json",
         &serde_json::to_vec(&json!({
-            "commits": commit_ids, "objects": object_ids, "blobs": blob_digests, "bindings": binding_ids,
+            "commits": commit_ids, "objects": object_ids, "blobs": blob_digests, "bindings": binding_ids, "checkpoints": checkpoint_ids,
         }))?,
     )?;
     let list = |k: &str| -> Vec<String> { have["missing"][k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default() };
-    let (m_commits, m_objects, m_blobs, m_bindings) = (list("commits"), list("objects"), list("blobs"), list("bindings"));
+    let (m_commits, m_objects, m_blobs, m_bindings, m_checkpoints) = (list("commits"), list("objects"), list("blobs"), list("bindings"), list("checkpoints"));
 
     let repo = &config.repo_id;
     let mut missing_local = Vec::new();
-    let mut sent = json!({"blobs": 0, "objects": 0, "commits": 0, "bindings": 0});
+    let mut sent = json!({"blobs": 0, "objects": 0, "commits": 0, "bindings": 0, "checkpoints": 0});
     let mut bump = |k: &str| sent[k] = json!(sent[k].as_u64().unwrap_or(0) + 1);
 
     for d in &m_blobs {
@@ -152,6 +157,11 @@ pub fn push(ctx: &Ctx, server: Option<&str>, name: Option<&str>) -> Res<Out> {
         client.send("PUT", &format!("/api/v1/repos/{repo}/bindings/{id}"), "application/json", &bytes)?;
         bump("bindings");
     }
+    for id in &m_checkpoints {
+        let bytes = fs::read(ctx.store.dir.join("checkpoints").join(format!("{id}.json")))?;
+        client.send("PUT", &format!("/api/v1/repos/{repo}/checkpoints/{id}"), "application/json", &bytes)?;
+        bump("checkpoints");
+    }
 
     let partial = !missing_local.is_empty() || !unreadable.is_empty();
     Ok(Out {
@@ -159,13 +169,14 @@ pub fn push(ctx: &Ctx, server: Option<&str>, name: Option<&str>) -> Res<Out> {
             "server": client.base,
             "repo": slug,
             "repo_id": config.repo_id,
-            "offered": {"commits": commit_ids.len(), "objects": object_ids.len(), "blobs": blob_digests.len(), "bindings": binding_ids.len()},
+            "offered": {"commits": commit_ids.len(), "objects": object_ids.len(), "blobs": blob_digests.len(), "bindings": binding_ids.len(), "checkpoints": checkpoint_ids.len()},
             "sent": sent,
             "already_on_server": {
                 "commits": commit_ids.len() - m_commits.len(),
                 "objects": object_ids.len() - m_objects.len(),
                 "blobs": blob_digests.len() - m_blobs.len(),
                 "bindings": binding_ids.len() - m_bindings.len(),
+                "checkpoints": checkpoint_ids.len() - m_checkpoints.len(),
             },
             "missing_locally": missing_local,
             "unreadable_commits": unreadable,

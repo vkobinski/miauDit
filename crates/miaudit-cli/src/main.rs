@@ -259,7 +259,7 @@ fn run_hook(cmd: &Cmd) -> ! {
                 std::process::exit(2);
             }
             match commands::checkpoint(&ctx) {
-                Ok(Some(out)) => eprintln!("miaudit: checkpoint {} recorded", out.value["audit_id"].as_str().unwrap_or("?")),
+                Ok(Some(out)) => eprintln!("miaudit: checkpoint {} attached to {}", out.value["checkpoint_id"].as_str().unwrap_or("?"), out.value["audit_id"].as_str().unwrap_or("?")),
                 Ok(None) => {}
                 Err(e) => eprintln!("miaudit: checkpoint failed: {}", e.rule),
             }
