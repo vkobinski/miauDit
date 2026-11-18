@@ -139,6 +139,20 @@ echo "$page" | grep -q "integrity: pass"; check "viewer shows the live verify re
 echo "$page" | grep -q "hook_file_edits"; check "viewer shows the hook coverage row" $?
 echo "$page" | grep -q "full match"; check "viewer shows the Git link" $?
 
+cap() { printf '%s' "$1" | $M capture; }
+cap "$(printf '{"hook_event_name":"PostToolUse","session_id":"s","cwd":"%s","tool_name":"Bash","tool_input":{"command":"ls"},"tool_response":{"stdout":"E2E-OUTPUT-SECRET","exit_code":7}}' "$W")"
+cap "$(printf '{"hook_event_name":"PostToolUse","session_id":"s","cwd":"%s","tool_name":"Read","tool_input":{"file_path":"%s/a.txt"},"tool_response":{}}' "$W" "$W")"
+cap "$(printf '{"hook_event_name":"PostToolUse","session_id":"s","cwd":"%s","tool_name":"WebFetch","tool_input":{"url":"https://docs.example.com/p?token=E2E-URL-SECRET"},"tool_response":{}}' "$W")"
+cap "$(printf '{"hook_event_name":"PostToolUse","session_id":"s","cwd":"%s","tool_name":"Task","tool_input":{"subagent_type":"reviewer","prompt":"E2E-PROMPT-SECRET"},"tool_response":{}}' "$W")"
+cap "$(printf '{"hook_event_name":"SubagentStart","session_id":"s","agent_id":"ag-1","agent_type":"reviewer"}' )"
+printf '{"hook_event_name":"Stop","session_id":"s","last_assistant_message":"E2E-REPLY-SECRET","stop_hook_active":true}' | $M stop-check >/dev/null 2>&1; eq "stop-check records the assistant message and lets the agent stop" $? 0
+if grep -q -e E2E-OUTPUT-SECRET -e E2E-URL-SECRET -e E2E-PROMPT-SECRET -e E2E-REPLY-SECRET .miaudit/events.jsonl; then check "no output, URL query, prompt or reply text in the event log" 1; else check "no output, URL query, prompt or reply text in the event log" 0; fi
+grep -q '"exit_code":7' .miaudit/events.jsonl; check "command exit code is recorded" $?
+grep -q '"host":"docs.example.com"' .miaudit/events.jsonl; check "web fetch records only the host" $?
+grep -q '"action":"spawn"' .miaudit/events.jsonl; check "subagent spawn is recorded" $?
+grep -q '"kind":"assistant_message"' .miaudit/events.jsonl; check "assistant message digest is recorded" $?
+$M events --json >/dev/null; eq "event chain still verifies" $? 0
+
 printf 'ui\n' > c.txt
 printf '{"schema_version":"1","description":"frontend task","change_kind":"frontend"}' > ctx2.json
 $M add c.txt --json >/dev/null
@@ -158,6 +172,10 @@ printf '{"schema_version":"1","question":"q2","choice":"c","alternatives":["x"],
 $M decision add --file dec2.json --json >/dev/null
 $M commit -m "frontend change" --json > commit2.out; eq "frontend audit commit exits 0" $? 0
 AID2=$(jget result.audit_id < commit2.out)
+cov=$($M show "$AID2" --json | python3 -c "import json,sys;m=json.load(sys.stdin)['result']['manifest'];print(sorted(c['capability'] for c in m['coverage'] if c['provenance']=='observed' and c['capability']!='hook_file_edits'))")
+eq "all four capture capabilities are observed" "$cov" "['agent_topology', 'command_execution_receipts', 'conversation_capture', 'resource_access_receipts']"
+$M show "$AID2" --json | grep -q "CAPTURE_PARTIAL:resource_access_receipts"; check "gaps say the capture is partial" $?
+$M verify "$AID2" --json >/dev/null; eq "verify passes the audit with the new events" $? 0
 EID=$($M show "$AID2" --json | python3 -c "import json,sys;print([e['id'] for e in json.load(sys.stdin)['result']['objects']['evidence'] if e['object']['body'].get('phase')=='before'][0])")
 code=$(curl -s -o img.out -w '%{http_code}:%{content_type}' "http://127.0.0.1:$PORT/audit/$AID2/evidence/$EID/image")
 eq "viewer serves the screenshot as image/png" "$code" "200:image/png"

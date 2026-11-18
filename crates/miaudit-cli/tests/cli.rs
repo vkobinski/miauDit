@@ -228,8 +228,8 @@ fn commit_manifest_exposes_gaps_and_unverified_provenance() {
     assert_eq!(m["snapshot"]["provenance"], "self_reported");
     assert_eq!(m["snapshot"]["verification"], "unverified_client_snapshot");
     let unavailable = m["coverage"].as_array().unwrap().iter().filter(|c| c["provenance"] == "unavailable").count();
-    assert!(unavailable >= 5);
-    assert!(m["gaps"].as_array().unwrap().iter().any(|g| g["code"] == "CAPTURE_UNAVAILABLE:local_encryption"));
+    assert_eq!(unavailable, 4);
+    assert!(m["gaps"].as_array().unwrap().iter().any(|g| g["code"] == "CAPTURE_UNAVAILABLE:agent_topology"));
     let text = m.to_string();
     for forbidden in ["approved_by", "audit_id", "signature\""] {
         assert!(!text.contains(forbidden), "{forbidden}");

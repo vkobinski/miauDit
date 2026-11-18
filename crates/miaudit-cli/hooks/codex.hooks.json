@@ -24,7 +24,29 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(Bash|apply_patch)$",
+        "matcher": "^(Bash|apply_patch|spawn_agent|mcp__.*)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.cargo/bin/miaudit capture --agent codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.cargo/bin/miaudit capture --agent codex",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
         "hooks": [
           {
             "type": "command",
@@ -39,7 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.cargo/bin/miaudit stop-check",
+            "command": "$HOME/.cargo/bin/miaudit stop-check --agent codex",
             "timeout": 30
           }
         ]

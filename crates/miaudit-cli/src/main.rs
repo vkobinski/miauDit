@@ -59,7 +59,10 @@ enum Cmd {
         #[arg(long, value_enum, default_value = "claude-code")]
         agent: events::Agent,
     },
-    StopCheck,
+    StopCheck {
+        #[arg(long, value_enum, default_value = "claude-code")]
+        agent: events::Agent,
+    },
     SessionStart,
     Project { #[command(subcommand)] op: ProjectOp },
     Show { id: String },
@@ -110,7 +113,7 @@ fn run(cli: &Cli) -> error::Res<Out> {
         Cmd::Events => commands::events_status(&ctx),
         Cmd::Project { op: ProjectOp::Init } => commands::project_init(&ctx),
         Cmd::Project { op: ProjectOp::Check } => commands::project_check(&ctx),
-        Cmd::Capture { .. } | Cmd::StopCheck | Cmd::SessionStart => unreachable!("handled before the JSON envelope"),
+        Cmd::Capture { .. } | Cmd::StopCheck { .. } | Cmd::SessionStart => unreachable!("handled before the JSON envelope"),
         Cmd::Show { id } => commands::show(&ctx, id),
         Cmd::Verify { id } => commands::verify(&ctx, id),
     }
@@ -179,7 +182,12 @@ fn run_hook(cmd: &Cmd) -> ! {
             print!("{}", project::session_message(&ctx.store));
             std::process::exit(0)
         }
-        _ => {
+        Cmd::StopCheck { agent } => {
+            if let Some(v) = &input
+                && let Err(e) = events::capture_stop(&ctx.store, v, *agent)
+            {
+                eprintln!("miaudit: stop capture failed: {}", e.rule);
+            }
             if input.as_ref().and_then(|v| v.get("stop_hook_active")).and_then(Value::as_bool) == Some(true) {
                 std::process::exit(0);
             }
@@ -191,12 +199,13 @@ fn run_hook(cmd: &Cmd) -> ! {
                 None => std::process::exit(0),
             }
         }
+        _ => std::process::exit(0),
     }
 }
 
 fn main() {
     let cli = Cli::parse();
-    if matches!(cli.cmd, Cmd::Capture { .. } | Cmd::StopCheck | Cmd::SessionStart) {
+    if matches!(cli.cmd, Cmd::Capture { .. } | Cmd::StopCheck { .. } | Cmd::SessionStart) {
         run_hook(&cli.cmd);
     }
     let (envelope, exit) = match run(&cli) {

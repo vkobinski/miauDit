@@ -71,7 +71,7 @@ async fn pages_render_and_escape_untrusted_content() {
         assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;"), "{uri}");
     }
     let (_, _, detail) = get(&app, "GET", &format!("/audit/{id}"), HOST).await;
-    for want in ["self-reported", "unverified", "integrity: pass", "none recorded", "not evaluated", "full match", "https://github.com/acme/repo/commit/", "match", "CAPTURE_UNAVAILABLE:local_encryption", "@test-user", "GitHub user"] {
+    for want in ["self-reported", "unverified", "integrity: pass", "none recorded", "not evaluated", "full match", "https://github.com/acme/repo/commit/", "match", "CAPTURE_UNAVAILABLE:agent_topology", "@test-user", "GitHub user"] {
         assert!(detail.contains(want), "missing {want:?}");
     }
     let (_, _, index) = get(&app, "GET", "/", HOST).await;

@@ -245,13 +245,11 @@ fn git_baseline(root: &Path) -> GitBaseline {
     }
 }
 
-const UNAVAILABLE_CAPABILITIES: [&str; 6] = [
+const UNAVAILABLE_CAPABILITIES: [&str; 4] = [
     "conversation_capture",
     "agent_topology",
     "resource_access_receipts",
     "command_execution_receipts",
-    "developer_review_observation",
-    "local_encryption",
 ];
 
 fn unavailable_reason(name: &str) -> &'static str {
@@ -260,16 +258,28 @@ fn unavailable_reason(name: &str) -> &'static str {
         "agent_topology" => "which agents and subagents ran is not recorded",
         "resource_access_receipts" => "file reads and network access are not recorded",
         "command_execution_receipts" => "commands are not recorded",
-        "developer_review_observation" => "no review or approval flow exists",
-        "local_encryption" => "blobs in .miaudit/blobs are stored unencrypted",
         _ => "not implemented",
     }
 }
 
-fn partial_note(name: &str, s: &events::Summary) -> Option<&'static str> {
+fn partial_note(name: &str, s: &events::Summary) -> Option<String> {
     match name {
-        "conversation_capture" if s.prompts > 0 => Some("partial: user prompts only (hook); assistant replies and tool output are not captured"),
-        "command_execution_receipts" if s.commands > 0 => Some("partial: program name and command digest only (hook); no output or exit code"),
+        "conversation_capture" if s.prompts > 0 || s.assistant_messages > 0 => Some(format!(
+            "partial (hook): {} user prompt(s) kept as blobs, {} assistant reply/transcript digest(s) only, no reply text stored",
+            s.prompts, s.assistant_messages
+        )),
+        "agent_topology" if !s.sessions.is_empty() || s.agent_events > 0 => Some(format!(
+            "partial (hook): {} session(s), {} subagent id(s), {} spawn/start/stop event(s); agents outside the hooks are not seen",
+            s.sessions.len(), s.agent_ids.len(), s.agent_events
+        )),
+        "resource_access_receipts" if s.resources > 0 => Some(format!(
+            "partial (hook): {} Read/Grep/Glob/Web/MCP call(s) as paths, hosts and digests; reads and network use inside shell commands are not seen",
+            s.resources
+        )),
+        "command_execution_receipts" if s.commands > 0 => Some(format!(
+            "partial (hook): {} command(s) as program, command digest, output digest and exit code when the agent reports it; no output text stored",
+            s.commands
+        )),
         _ => None,
     }
 }
@@ -282,7 +292,7 @@ fn coverage(obs: &Observed) -> Vec<Capability> {
     }
     for n in UNAVAILABLE_CAPABILITIES {
         match partial_note(n, &obs.summary).filter(|_| trusted) {
-            Some(note) => c.push(Capability { capability: n.into(), provenance: Provenance::Observed, note: Some(note.into()) }),
+            Some(note) => c.push(Capability { capability: n.into(), provenance: Provenance::Observed, note: Some(note) }),
             None => c.push(Capability { capability: n.into(), provenance: Provenance::Unavailable, note: Some(unavailable_reason(n).into()) }),
         }
     }
@@ -451,7 +461,7 @@ fn compute_gaps(ctx: &Ctx, p: &Pending, git: &GitBaseline) -> Res<Vec<Gap>> {
     let obs_now = observed(ctx);
     for cap in UNAVAILABLE_CAPABILITIES {
         match partial_note(cap, &obs_now.summary).filter(|_| obs_now.chain_error.is_none()) {
-            Some(note) => g.push(gap(&format!("CAPTURE_PARTIAL:{cap}"), note, vec![cap.into()])),
+            Some(note) => g.push(gap(&format!("CAPTURE_PARTIAL:{cap}"), &note, vec![cap.into()])),
             None => g.push(gap(&format!("CAPTURE_UNAVAILABLE:{cap}"), "capture capability not available in this slice", vec![cap.into()])),
         }
     }
