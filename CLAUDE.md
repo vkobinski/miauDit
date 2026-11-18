@@ -84,4 +84,5 @@ Optional, and **not active unless the user merges it into `.claude/settings.json
   - These fields are self-reported. The viewer shows the screenshots and the phase and environment, but nothing proves which version produced them.
   - `miaudit gaps` is advisory: `miaudit commit` still succeeds with these gaps. Do not commit an audit without this evidence unless the user explicitly waives it, and record the waiver as their statement.
 - The design contract lives in `docs/`. When behaviour and docs disagree, surface it to the user instead of silently changing either.
-- The UI is read-only and binds to `127.0.0.1` only. Keep it that way unless the user decides otherwise.
+- The local viewer is read-only and binds to `127.0.0.1` only. Keep it that way unless the user decides otherwise.
+- The interface is a React + TypeScript app in `web/`, embedded by `crates/miaudit-web` and served by both `miaudit-ui` and `miaudit-server` from the same JSON API. Keep the CSP free of `unsafe-inline` and `unsafe-eval`, render API values as text only (no `dangerouslySetInnerHTML`), and link only `https://github.com/` URLs. After UI changes run `cd web && npm test && npm run build` along with `cargo test --workspace`.

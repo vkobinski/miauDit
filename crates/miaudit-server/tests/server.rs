@@ -155,36 +155,49 @@ async fn push_then_browse_like_github() {
     assert_eq!(again["result"]["already_on_server"]["commits"], 1);
 
     let app = app(&db);
-    let (s, h, body) = get(&app, "/", None).await;
-    let home = text(body);
+    let (s, h, body) = get(&app, "/api/v1/config", None).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(home.contains("/acme/web") && home.contains("1 audit commit"), "{home}");
-    assert!(h["content-security-policy"].to_str().unwrap().contains("default-src 'none'"));
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["mode"], "server");
+    let csp = h["content-security-policy"].to_str().unwrap();
+    assert!(csp.contains("default-src 'none'") && csp.contains("script-src 'self'") && !csp.contains("unsafe-inline"), "{csp}");
 
-    let (_, _, body) = get(&app, "/?q=WEB", None).await;
-    assert!(text(body).contains("/acme/web"), "search is case-insensitive");
-    let (_, _, body) = get(&app, "/?q=nomatch", None).await;
-    assert!(text(body).contains("No repository matches"));
-    let (_, _, body) = get(&app, "/?q=.*", None).await;
-    assert!(text(body).contains("No repository matches"), "search input must not be treated as a regex");
+    let repos = |q: &str| {
+        let app = app.clone();
+        let uri = format!("/api/v1/repos{q}");
+        async move { serde_json::from_slice::<Value>(&get(&app, &uri, None).await.2).unwrap()["repos"].as_array().unwrap().clone() }
+    };
+    let all = repos("").await;
+    assert_eq!((all[0]["slug"].as_str(), all[0]["audits"].as_i64()), (Some("acme/web"), Some(1)));
+    assert_eq!(repos("?q=WEB").await.len(), 1, "search is case-insensitive");
+    assert_eq!(repos("?q=nomatch").await.len(), 0);
+    assert_eq!(repos("?q=.*").await.len(), 0, "search input must not be treated as a regex");
 
-    let (s, _, body) = get(&app, "/acme/web", None).await;
-    let repo = text(body);
+    let (s, _, body) = get(&app, "/acme/web/api/repo", None).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(!repo.contains("<script>alert(1)"), "unescaped script on repo page");
-    assert!(repo.contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;"));
-    assert!(repo.contains("@test-user") && repo.contains("full match"));
+    let info: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((info["repo"]["slug"].as_str(), info["authors"][0]["login"].as_str()), (Some("acme/web"), Some("test-user")));
 
-    let (s, _, body) = get(&app, &format!("/acme/web/audit/{}", f.audit_id), None).await;
-    let detail = text(body);
+    let (s, _, body) = get(&app, "/acme/web/api/audits", None).await;
     assert_eq!(s, StatusCode::OK);
-    for want in ["integrity: pass", "self-reported", "after screenshot", "Decisions", "full match", "/acme/web/api/audits/", "/acme/web/audit/"] {
-        assert!(detail.contains(want), "missing {want:?}");
-    }
-    assert!(!detail.contains("<script>alert(1)"), "unescaped script on detail page");
+    let list: Value = serde_json::from_slice(&body).unwrap();
+    let row = &list["audits"][0];
+    assert_eq!((list["total"].as_i64(), row["description"].as_str(), row["author"].as_str()), (Some(1), Some(XSS), Some("test-user")), "the API returns untrusted text untouched; the UI escapes it");
+    assert_eq!(row["git"][0]["correspondence"], "full");
+    assert!(row["gap_codes"].as_array().unwrap().iter().any(|c| c == "NO_HUMAN_APPROVAL"));
 
-    let eid = detail.split("/evidence/").nth(1).unwrap().split("/image").next().unwrap().to_string();
-    let (s, h, body) = get(&app, &format!("/acme/web/audit/{}/evidence/{eid}/image", f.audit_id), None).await;
+    let (s, h, body) = get(&app, &format!("/acme/web/api/audits/{}/detail", f.audit_id), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["content-type"], "application/json");
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(detail["verification"]["integrity"], "pass");
+    assert_eq!(detail["bindings"][0]["body"]["correspondence"], "full");
+    assert_eq!(detail["decisions"][0]["object"]["provenance"], "self_reported");
+    assert_eq!(detail["evidence"][0]["object"]["body"]["description"], "after screenshot");
+    assert_eq!(detail["evidence"][0]["image"], true);
+    assert!(detail["manifest"]["snapshot"].get("entries").is_none());
+
+    let eid = detail["evidence"][0]["id"].as_str().unwrap().to_string();
+    let (s, h, body) = get(&app, &format!("/acme/web/api/audits/{}/evidence/{eid}/image", f.audit_id), None).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(h["content-type"], "image/png");
     assert_eq!(body, PNG);
@@ -193,15 +206,21 @@ async fn push_then_browse_like_github() {
     let (_, _, raw) = get(&app, &format!("/acme/web/api/audits/{}", f.audit_id), None).await;
     assert_eq!(raw, local, "the server must return the exact manifest bytes it was given");
 
-    let (_, _, body) = get(&app, "/api/v1/repos", None).await;
-    let v: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["repos"][0]["slug"], "acme/web");
-    assert_eq!(v["repos"][0]["audits"], 1);
+    let total = |q: &str| {
+        let app = app.clone();
+        let uri = format!("/acme/web/api/audits{q}");
+        async move { serde_json::from_slice::<Value>(&get(&app, &uri, None).await.2).unwrap()["total"].as_i64().unwrap() }
+    };
+    assert_eq!(total("?author=test-user").await, 1);
+    assert_eq!(total("?author=nobody").await, 0);
 
-    let (_, _, body) = get(&app, "/acme/web?author=test-user", None).await;
-    assert!(text(body).contains("1 audit commit"));
-    let (_, _, body) = get(&app, "/acme/web?author=nobody", None).await;
-    assert!(text(body).contains("No audit commits match"));
+    for uri in ["/", "/acme/web", &format!("/acme/web/audit/{}", f.audit_id)] {
+        let (s, h, body) = get(&app, uri, None).await;
+        let shell = text(body);
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert!(h["content-type"].to_str().unwrap().starts_with("text/html"), "{uri}");
+        assert!(shell.contains(r#"id="root""#) && !shell.contains("<script>"), "{uri}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -214,14 +233,16 @@ async fn repos_are_isolated_and_slugs_cannot_be_taken() {
     assert_eq!(push(&b, &live, &live.token, None).1, 0);
 
     let app = app(&db);
-    let (_, _, body) = get(&app, "/acme/one", None).await;
+    let (_, _, body) = get(&app, "/acme/one/api/audits", None).await;
     let page = text(body);
     assert!(page.contains("audit of one") && !page.contains("audit of two"));
-    let (s, _, _) = get(&app, &format!("/acme/one/audit/{}", b.audit_id), None).await;
+    let (s, _, _) = get(&app, &format!("/acme/one/api/audits/{}/detail", b.audit_id), None).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "an audit of repo two must not open under repo one");
-    let (_, _, body) = get(&app, "/", None).await;
-    let home = text(body);
-    assert!(home.contains("/acme/one") && home.contains("/acme/two") && home.contains("2 total"));
+    let (s, _, _) = get(&app, &format!("/acme/one/api/audits/{}", b.audit_id), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (_, _, body) = get(&app, "/api/v1/repos", None).await;
+    let slugs: Vec<String> = serde_json::from_slice::<Value>(&body).unwrap()["repos"].as_array().unwrap().iter().map(|r| r["slug"].as_str().unwrap().to_string()).collect();
+    assert!(slugs.contains(&"acme/one".to_string()) && slugs.contains(&"acme/two".to_string()) && slugs.len() == 2, "{slugs:?}");
 
     let c = fixture("git@github.com:someone/else.git", "third");
     let (out, code) = push(&c, &live, &live.token, Some("acme/one"));
@@ -289,6 +310,9 @@ async fn revoked_token_stops_working_and_read_password_gates_the_ui() {
     assert_eq!(get(&app, "/", Some(&b64("me:wrong"))).await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(get(&app, "/", Some(&b64("me:hunter2"))).await.0, StatusCode::OK);
     assert_eq!(get(&app, "/api/v1/repos", None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(get(&app, "/acme/web", None).await.0, StatusCode::UNAUTHORIZED, "the app shell is behind the password too");
+    assert_eq!(get(&app, "/acme/web/api/audits", None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(get(&app, "/acme/web", Some(&b64("me:hunter2"))).await.0, StatusCode::OK);
     assert_eq!(get(&app, "/healthz", None).await.0, StatusCode::OK);
 
     let tokens = db.list_tokens().await.unwrap();
@@ -298,11 +322,14 @@ async fn revoked_token_stops_working_and_read_password_gates_the_ui() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unknown_pages_and_bad_ids_are_404() {
+async fn unknown_api_paths_and_bad_ids_are_404_but_app_routes_get_the_shell() {
     let Some(db) = test_db().await else { return };
     let app = app(&db);
-    for bad in ["/nothing", "/no/such", "/acme/web/audit/nope", "/acme/web/audit/audit_..%2F..", "/a%20b/c", "/api/x"] {
+    for bad in ["/acme/web/api/audits/nope", "/acme/web/api/audits/audit_..%2F..", "/a%20b/c/api/audits", "/api/x", "/acme/web/api/nothing", "/acme/web/api/audits", "/assets/missing.js"] {
         assert_eq!(get(&app, bad, None).await.0, StatusCode::NOT_FOUND, "{bad}");
+    }
+    for spa in ["/nothing", "/no/such", "/acme/web/audit/nope"] {
+        assert_eq!(get(&app, spa, None).await.0, StatusCode::OK, "{spa}: the React router renders its own not-found page");
     }
 }
 

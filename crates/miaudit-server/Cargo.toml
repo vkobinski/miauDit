@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 miaudit-schema = { path = "../miaudit-schema" }
 miaudit-ui = { path = "../miaudit-ui" }
+miaudit-web = { path = "../miaudit-web" }
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }

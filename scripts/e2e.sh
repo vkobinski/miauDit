@@ -133,13 +133,19 @@ PORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print
 UIPID=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.3; done
 eq "viewer index returns 200" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")" 200
-eq "viewer detail page returns 200" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/audit/$AID")" 200
+VSLUG=$(curl -s "http://127.0.0.1:$PORT/api/v1/config" | jget repo)
+eq "viewer reports local mode" "$(curl -s "http://127.0.0.1:$PORT/api/v1/config" | jget mode)" local
+eq "viewer detail route returns the app shell (200)" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/$VSLUG/audit/$AID")" 200
+shell=$(curl -s "http://127.0.0.1:$PORT/")
+echo "$shell" | grep -q 'id="root"'; check "viewer serves the React app shell" $?
+echo "$shell" | grep -q '<script>'; [ $? -ne 0 ]; check "app shell has no inline script" $?
+curl -s -D - -o /dev/null "http://127.0.0.1:$PORT/" | tr -d '\r' | grep -i '^content-security-policy:' | grep -q "script-src 'self'"; check "viewer sends a script-src 'self' CSP" $?
 eq "viewer rejects a foreign Host header (403)" "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' "http://127.0.0.1:$PORT/")" 403
 eq "viewer rejects POST (405)" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/")" 405
-page=$(curl -s "http://127.0.0.1:$PORT/audit/$AID")
-echo "$page" | grep -q "integrity: pass"; check "viewer shows the live verify result" $?
-echo "$page" | grep -q "hook_file_edits"; check "viewer shows the hook coverage row" $?
-echo "$page" | grep -q "full match"; check "viewer shows the Git link" $?
+page=$(curl -s "http://127.0.0.1:$PORT/$VSLUG/api/audits/$AID/detail")
+eq "viewer API returns the live verify result" "$(echo "$page" | jget verification.integrity)" pass
+echo "$page" | grep -q "hook_file_edits"; check "viewer API returns the hook coverage row" $?
+eq "viewer API returns the Git link" "$(echo "$page" | jget bindings.0.body.correspondence)" full
 
 cap() { printf '%s' "$1" | $M capture; }
 cap "$(printf '{"hook_event_name":"PostToolUse","session_id":"s","cwd":"%s","tool_name":"Bash","tool_input":{"command":"ls"},"tool_response":{"stdout":"E2E-OUTPUT-SECRET","exit_code":7}}' "$W")"
@@ -179,10 +185,10 @@ eq "all four capture capabilities are observed" "$cov" "['agent_topology', 'comm
 $M show "$AID2" --json | grep -q "CAPTURE_PARTIAL:resource_access_receipts"; check "gaps say the capture is partial" $?
 $M verify "$AID2" --json >/dev/null; eq "verify passes the audit with the new events" $? 0
 EID=$($M show "$AID2" --json | python3 -c "import json,sys;print([e['id'] for e in json.load(sys.stdin)['result']['objects']['evidence'] if e['object']['body'].get('phase')=='before'][0])")
-code=$(curl -s -o img.out -w '%{http_code}:%{content_type}' "http://127.0.0.1:$PORT/audit/$AID2/evidence/$EID/image")
+code=$(curl -s -o img.out -w '%{http_code}:%{content_type}' "http://127.0.0.1:$PORT/$VSLUG/api/audits/$AID2/evidence/$EID/image")
 eq "viewer serves the screenshot as image/png" "$code" "200:image/png"
 cmp -s img.out shot.png; check "served screenshot is byte-identical to the attached file" $?
-curl -s "http://127.0.0.1:$PORT/audit/$AID2" | grep -q "<img"; check "viewer page embeds the screenshot" $?
+eq "viewer API flags the screenshot as an image" "$(curl -s "http://127.0.0.1:$PORT/$VSLUG/api/audits/$AID2/detail" | python3 -c "import json,sys;print(any(e['image'] for e in json.load(sys.stdin)['evidence']))")" True
 
 if [ -n "${MIAUDIT_TEST_MONGO_URI:-}" ] && [ -x "$SRV" ]; then
   SPORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])")
@@ -205,12 +211,13 @@ if [ -n "${MIAUDIT_TEST_MONGO_URI:-}" ] && [ -x "$SRV" ]; then
   curl -s "http://127.0.0.1:$SPORT/api/v1/repos" > repos.out
   eq "server lists the repo with its audit count" "$(jget repos.0.audits < repos.out)" "$OFFERED"
   eq "server lists the pushed slug" "$(jget repos.0.slug < repos.out)" "$SLUG"
-  curl -s "http://127.0.0.1:$SPORT/" | grep -q "/$SLUG"; check "repo list page links the repo" $?
-  curl -s "http://127.0.0.1:$SPORT/$SLUG" | grep -q "frontend change"; check "repo page lists the audit commits" $?
+  curl -s "http://127.0.0.1:$SPORT/" | grep -q 'id="root"'; check "server serves the React app shell" $?
+  eq "server reports server mode" "$(curl -s "http://127.0.0.1:$SPORT/api/v1/config" | jget mode)" server
+  curl -s "http://127.0.0.1:$SPORT/$SLUG/api/audits" | grep -q "frontend change"; check "repo audit list API returns the audit commits" $?
   code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SPORT/$SLUG/audit/$AID2")
-  eq "audit page opens under the repo" "$code" 200
-  curl -s "http://127.0.0.1:$SPORT/$SLUG/audit/$AID2" | grep -q "integrity: pass"; check "server-side integrity check passes" $?
-  code=$(curl -s -o img2.out -w '%{http_code}:%{content_type}' "http://127.0.0.1:$SPORT/$SLUG/audit/$AID2/evidence/$EID/image")
+  eq "audit route opens under the repo (app shell)" "$code" 200
+  eq "server-side integrity check passes" "$(curl -s "http://127.0.0.1:$SPORT/$SLUG/api/audits/$AID2/detail" | jget verification.integrity)" pass
+  code=$(curl -s -o img2.out -w '%{http_code}:%{content_type}' "http://127.0.0.1:$SPORT/$SLUG/api/audits/$AID2/evidence/$EID/image")
   eq "server serves the screenshot as image/png" "$code" "200:image/png"
   cmp -s img2.out shot.png; check "server screenshot is byte-identical to the attached file" $?
   curl -s "http://127.0.0.1:$SPORT/$SLUG/api/audits/$AID2" > raw.out

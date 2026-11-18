@@ -51,6 +51,14 @@ fn app(d: &TempDir) -> axum::Router {
     router(AppState { repo: d.path().canonicalize().unwrap(), port: PORT, audit_bin: audit_bin() })
 }
 
+fn slug(d: &TempDir) -> String {
+    miaudit_ui::local_slug(&d.path().canonicalize().unwrap())
+}
+
+fn json(body: &str) -> serde_json::Value {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("not json ({e}): {body}"))
+}
+
 async fn get(app: &axum::Router, method: &str, uri: &str, host: &str) -> (StatusCode, axum::http::HeaderMap, String) {
     let req = Request::builder().method(method).uri(uri).header("host", host).body(Body::empty()).unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
@@ -61,82 +69,171 @@ async fn get(app: &axum::Router, method: &str, uri: &str, host: &str) -> (Status
 const HOST: &str = "127.0.0.1:7070";
 
 #[tokio::test]
-async fn pages_render_and_escape_untrusted_content() {
+async fn api_serves_config_repo_audits_and_detail() {
     let (d, id) = fixture();
     let app = app(&d);
-    for uri in ["/".to_string(), format!("/audit/{id}")] {
-        let (s, _, body) = get(&app, "GET", &uri, HOST).await;
+    let slug = slug(&d);
+
+    let (s, h, body) = get(&app, "GET", "/api/v1/config", HOST).await;
+    assert_eq!((s, h["content-type"].to_str().unwrap()), (StatusCode::OK, "application/json"));
+    let c = json(&body);
+    assert_eq!((c["mode"].as_str(), c["repo"].as_str()), (Some("local"), Some(slug.as_str())));
+
+    let repos = json(&get(&app, "GET", "/api/v1/repos", HOST).await.2);
+    assert_eq!(repos["repos"][0]["slug"], slug.as_str());
+    assert_eq!(repos["repos"][0]["audits"], 1);
+    assert!(repos["repos"][0]["repo_id"].as_str().unwrap().starts_with("repo_"));
+
+    let info = json(&get(&app, "GET", &format!("/{slug}/api/repo"), HOST).await.2);
+    assert_eq!(info["authors"][0]["login"], "test-user");
+
+    let list = json(&get(&app, "GET", &format!("/{slug}/api/audits"), HOST).await.2);
+    assert_eq!((list["total"].as_u64(), list["page"].as_u64(), list["per_page"].as_u64()), (Some(1), Some(1), Some(25)));
+    let row = &list["audits"][0];
+    assert_eq!(row["audit_id"], id.as_str());
+    assert_eq!(row["author"], "test-user");
+    assert_eq!(row["git"][0]["correspondence"], "full");
+    assert!(row["git"][0]["url"].as_str().unwrap().starts_with("https://github.com/acme/repo/commit/"));
+    assert!(row["gap_codes"].as_array().unwrap().iter().any(|c| c == "CAPTURE_UNAVAILABLE:agent_topology"));
+
+    let (s, _, raw) = get(&app, "GET", &format!("/{slug}/api/audits/{id}"), HOST).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(raw.contains("\"snapshot\""));
+
+    let (s, _, body) = get(&app, "GET", &format!("/{slug}/api/audits/{id}/detail"), HOST).await;
+    assert_eq!(s, StatusCode::OK);
+    let d = json(&body);
+    assert_eq!(d["verification"]["state"], "result");
+    assert_eq!(d["verification"]["integrity"], "pass");
+    assert_eq!(d["bindings"][0]["body"]["correspondence"], "full");
+    assert_eq!(d["contexts"][0]["object"]["provenance"], "self_reported");
+    assert_eq!(d["contexts"][0]["object"]["body"]["source_refs"][0], "policy://x");
+    assert_eq!(d["manifest"]["snapshot"]["entries_count"], 1);
+    assert!(d["manifest"]["snapshot"].get("entries").is_none(), "the full tree is not sent to the browser");
+    assert_eq!(d["manifest"]["author"]["github_login"], "test-user");
+}
+
+#[tokio::test]
+async fn untrusted_text_is_returned_as_data_with_safe_headers() {
+    let (d, id) = fixture();
+    let app = app(&d);
+    let slug = slug(&d);
+    let (s, h, body) = get(&app, "GET", &format!("/{slug}/api/audits/{id}/detail"), HOST).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["content-type"], "application/json");
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    let d = json(&body);
+    assert_eq!(d["manifest"]["description"], XSS, "escaping is the renderer's job; the API must not alter the text");
+    assert_eq!(d["contexts"][0]["object"]["body"]["description"], XSS);
+}
+
+#[tokio::test]
+async fn app_routes_get_the_react_shell_with_no_inline_script() {
+    let (d, id) = fixture();
+    let app = app(&d);
+    let slug = slug(&d);
+    for uri in ["/".to_string(), format!("/{slug}"), format!("/{slug}/audit/{id}")] {
+        let (s, h, body) = get(&app, "GET", &uri, HOST).await;
         assert_eq!(s, StatusCode::OK, "{uri}");
-        assert!(!body.contains("<script>alert(1)"), "unescaped script on {uri}");
-        assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;"), "{uri}");
+        assert!(h["content-type"].to_str().unwrap().starts_with("text/html"), "{uri}");
+        assert!(body.contains(r#"id="root""#) && body.contains("/assets/"), "{uri}");
+        assert!(!body.contains("<script>"), "an inline script would break the CSP: {uri}");
     }
-    let (_, _, detail) = get(&app, "GET", &format!("/audit/{id}"), HOST).await;
-    for want in ["self-reported", "unverified", "integrity: pass", "none recorded", "not evaluated", "full match", "https://github.com/acme/repo/commit/", "match", "CAPTURE_UNAVAILABLE:agent_topology", "@test-user", "GitHub user"] {
-        assert!(detail.contains(want), "missing {want:?}");
-    }
-    let (_, _, index) = get(&app, "GET", "/", HOST).await;
-    assert!(index.contains("https://github.com/acme/repo/commit/") && index.contains("full match"));
+    let (_, _, shell) = get(&app, "GET", "/", HOST).await;
+    let js = shell.split("src=\"/assets/").nth(1).unwrap().split('"').next().unwrap();
+    let (s, h, _) = get(&app, "GET", &format!("/assets/{js}"), HOST).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h["content-type"].to_str().unwrap().contains("javascript"));
 }
 
 #[tokio::test]
 async fn rejects_foreign_hosts_and_non_get_methods() {
     let (d, id) = fixture();
     let app = app(&d);
+    let slug = slug(&d);
     for host in ["evil.com", "evil.com:7070", "127.0.0.1:9999", "127.0.0.1", ""] {
-        assert_eq!(get(&app, "GET", "/", host).await.0, StatusCode::FORBIDDEN, "{host:?}");
+        for uri in ["/", "/api/v1/config"] {
+            assert_eq!(get(&app, "GET", uri, host).await.0, StatusCode::FORBIDDEN, "{host:?} {uri}");
+        }
     }
     assert_eq!(get(&app, "GET", "/", "localhost:7070").await.0, StatusCode::OK);
     for m in ["POST", "PUT", "DELETE", "PATCH"] {
-        assert_eq!(get(&app, m, "/", HOST).await.0, StatusCode::METHOD_NOT_ALLOWED, "{m}");
-        assert_eq!(get(&app, m, &format!("/audit/{id}"), HOST).await.0, StatusCode::METHOD_NOT_ALLOWED, "{m}");
+        for uri in ["/".to_string(), "/api/v1/repos".to_string(), format!("/{slug}/api/audits/{id}/detail"), format!("/{slug}/audit/{id}")] {
+            assert_eq!(get(&app, m, &uri, HOST).await.0, StatusCode::METHOD_NOT_ALLOWED, "{m} {uri}");
+        }
     }
 }
 
 #[tokio::test]
-async fn sets_security_headers_and_rejects_bad_ids() {
-    let (d, _) = fixture();
+async fn sets_a_strict_csp_and_rejects_bad_ids_and_other_repos() {
+    let (d, id) = fixture();
     let app = app(&d);
+    let slug = slug(&d);
     let (_, h, _) = get(&app, "GET", "/", HOST).await;
-    assert!(h["content-security-policy"].to_str().unwrap().contains("default-src 'none'"));
+    let csp = h["content-security-policy"].to_str().unwrap();
+    assert!(csp.contains("default-src 'none'") && csp.contains("script-src 'self'") && csp.contains("connect-src 'self'") && csp.contains("frame-ancestors 'none'"), "{csp}");
+    assert!(!csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"), "{csp}");
     assert_eq!(h["x-content-type-options"], "nosniff");
     assert_eq!(h["cache-control"], "no-store");
-    for bad in ["/audit/nope", "/audit/audit_..%2F..%2Fconfig", "/audit/audit_AAAA", "/api/audits/../../etc/passwd", "/nothing"] {
-        assert_eq!(get(&app, "GET", bad, HOST).await.0, StatusCode::NOT_FOUND, "{bad}");
+    for bad in [
+        format!("/{slug}/api/audits/nope"),
+        format!("/{slug}/api/audits/audit_..%2F..%2Fconfig"),
+        format!("/{slug}/api/audits/audit_AAAA/detail"),
+        format!("/{slug}/api/audits/../../etc/passwd"),
+        format!("/other/repo/api/audits/{id}/detail"),
+        "/other/repo/api/audits".to_string(),
+        "/api/v1/nothing".to_string(),
+        format!("/{slug}/api/nothing"),
+    ] {
+        assert_eq!(get(&app, "GET", &bad, HOST).await.0, StatusCode::NOT_FOUND, "{bad}");
     }
-    let unknown = format!("/audit/audit_{}", "0".repeat(64));
+    let unknown = format!("/{slug}/api/audits/audit_{}/detail", "0".repeat(64));
     assert_eq!(get(&app, "GET", &unknown, HOST).await.0, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn json_api_and_tampering_is_visible() {
+async fn list_filters_by_author_and_gap_prefix_and_pages() {
+    let (d, _) = fixture();
+    let app = app(&d);
+    let slug = slug(&d);
+    let total = |q: &str| {
+        let app = app.clone();
+        let uri = format!("/{slug}/api/audits{q}");
+        async move { json(&get(&app, "GET", &uri, HOST).await.2)["total"].as_u64().unwrap() }
+    };
+    assert_eq!(total("").await, 1);
+    assert_eq!(total("?author=test-user").await, 1);
+    assert_eq!(total("?author=nobody").await, 0);
+    assert_eq!(total("?gap=CAPTURE_UNAVAILABLE").await, 1);
+    assert_eq!(total("?gap=NO_HUMAN").await, 1);
+    assert_eq!(total("?gap=CAPTURE_PARTIAL").await, 0);
+    assert_eq!(total("?gap=NO_SUCH.*").await, 0, "the gap filter is a prefix, not a regex");
+    let page2 = json(&get(&app, "GET", &format!("/{slug}/api/audits?page=2"), HOST).await.2);
+    assert_eq!(page2["audits"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn tampering_is_visible_in_the_detail_verification() {
     let (d, id) = fixture();
     let app = app(&d);
-    let (s, h, body) = get(&app, "GET", "/api/audits", HOST).await;
-    assert_eq!((s, h["content-type"].to_str().unwrap()), (StatusCode::OK, "application/json"));
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["audits"][0]["audit_id"], id.as_str());
-    assert_eq!(v["audits"][0]["git"][0]["correspondence"], "full");
-    let (s, _, raw) = get(&app, "GET", &format!("/api/audits/{id}"), HOST).await;
-    assert_eq!(s, StatusCode::OK);
-    assert!(raw.contains("\"snapshot\""));
-
+    let slug = slug(&d);
     let path = d.path().join(format!(".miaudit/commits/{id}.json"));
     let text = fs::read_to_string(&path).unwrap().replace("staged_paths_only", "staged_paths_onlx");
     fs::write(&path, text).unwrap();
-    let (_, _, detail) = get(&app, "GET", &format!("/audit/{id}"), HOST).await;
-    assert!(detail.contains("integrity: fail"), "tampering not shown");
+    let (_, _, body) = get(&app, "GET", &format!("/{slug}/api/audits/{id}/detail"), HOST).await;
+    assert_eq!(json(&body)["verification"]["integrity"], "fail", "tampering not shown");
 }
 
 #[tokio::test]
 async fn uninitialized_repo_reports_a_clear_error() {
     let d = tempfile::tempdir().unwrap();
-    let (s, _, body) = get(&app(&d), "GET", "/", HOST).await;
+    let (s, _, body) = get(&app(&d), "GET", "/api/v1/repos", HOST).await;
     assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(body.contains("not an initialized audit repository"));
+    assert!(json(&body)["error"]["message"].as_str().unwrap().contains("not an initialized audit repository"));
 }
 
 #[tokio::test]
-async fn screenshot_evidence_is_rendered_and_only_real_images_are_served() {
+async fn screenshot_evidence_is_listed_and_only_real_images_are_served() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path();
     let a = audit_bin();
@@ -155,13 +252,17 @@ async fn screenshot_evidence_is_rendered_and_only_real_images_are_served() {
     let id = serde_json::from_str::<serde_json::Value>(&run(p, a, &["--json", "commit", "-m", "shots"])).unwrap()["result"]["audit_id"].as_str().unwrap().to_string();
     let app = app(&d);
 
-    let (s, _, page) = get(&app, "GET", &format!("/audit/{id}"), HOST).await;
+    let slug = slug(&d);
+    let (s, _, body) = get(&app, "GET", &format!("/{slug}/api/audits/{id}/detail"), HOST).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(page.contains(&format!("src=\"/audit/{id}/evidence/{e1}/image\"")));
-    assert!(!page.contains(&format!("evidence/{e2}/image")));
-    assert!(page.contains("Staging") && page.contains("After"));
+    let detail = json(&body);
+    let item = |eid: &str| detail["evidence"].as_array().unwrap().iter().find(|e| e["id"] == eid).unwrap().clone();
+    assert_eq!(item(&e1)["image"], true);
+    assert_eq!(item(&e2)["image"], false, "content that is not an image is never flagged as one");
+    assert_eq!(item(&e1)["object"]["body"]["environment"], "staging");
+    assert_eq!(item(&e1)["object"]["body"]["phase"], "after");
 
-    let req = Request::builder().uri(format!("/audit/{id}/evidence/{e1}/image")).header("host", HOST).body(Body::empty()).unwrap();
+    let req = Request::builder().uri(format!("/{slug}/api/audits/{id}/evidence/{e1}/image")).header("host", HOST).body(Body::empty()).unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.headers()["content-type"], "image/png");
@@ -169,10 +270,10 @@ async fn screenshot_evidence_is_rendered_and_only_real_images_are_served() {
     assert!(res.headers()["content-security-policy"].to_str().unwrap().contains("img-src 'self'"));
     assert_eq!(res.into_body().collect().await.unwrap().to_bytes().to_vec(), png);
 
-    let (s, _, _) = get(&app, "GET", &format!("/audit/{id}/evidence/{e2}/image"), HOST).await;
+    let (s, _, _) = get(&app, "GET", &format!("/{slug}/api/audits/{id}/evidence/{e2}/image"), HOST).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "content that is not an image must never be served");
-    let (s, _, _) = get(&app, "GET", &format!("/audit/{id}/evidence/evd_{}/image", "0".repeat(64)), HOST).await;
+    let (s, _, _) = get(&app, "GET", &format!("/{slug}/api/audits/{id}/evidence/evd_{}/image", "0".repeat(64)), HOST).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
-    let (s, _, _) = get(&app, "GET", &format!("/audit/{id}/evidence/{e1}/image"), "evil.example").await;
+    let (s, _, _) = get(&app, "GET", &format!("/{slug}/api/audits/{id}/evidence/{e1}/image"), "evil.example").await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 }

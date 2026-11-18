@@ -3,7 +3,7 @@ use miaudit_schema::{
     input::{ContextInput, DecisionInput},
     model::{EvidenceBody, Manifest, Stored, StoredBinding},
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{fs, path::{Path, PathBuf}, process::Command};
 
 pub fn valid_audit_id(id: &str) -> bool {
@@ -80,6 +80,11 @@ impl Repo {
         Ok(Repo { dir, root: root.to_path_buf(), summaries, unreadable })
     }
 
+    pub fn repo_id(&self) -> Option<String> {
+        let config: Value = read_json(&self.dir.join("config.json"))?;
+        config["repo_id"].as_str().map(String::from)
+    }
+
     pub fn raw_manifest(&self, id: &str) -> Option<Vec<u8>> {
         fs::read(self.dir.join("commits").join(format!("{id}.json"))).ok()
     }
@@ -144,14 +149,6 @@ impl Repo {
             decisions: m.decision_ids.iter().map(|i| Item { id: i.clone(), object: self.object("decisions", i) }).collect(),
             evidence,
         })
-    }
-
-    pub fn summaries_json(&self) -> Value {
-        json!({"repo": self.root, "unreadable": self.unreadable, "audits": self.summaries.iter().map(|s| json!({
-            "audit_id": s.id, "created_at": s.manifest.created.at, "description": s.manifest.description,
-            "changes": s.manifest.snapshot.changes.len(), "gaps": s.manifest.gaps.len(), "parents": s.manifest.parents,
-            "git": s.bindings.iter().map(|b| json!({"commit": b.body.git.commit, "correspondence": b.body.correspondence, "url": b.body.git.commit_web_url})).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>()})
     }
 }
 

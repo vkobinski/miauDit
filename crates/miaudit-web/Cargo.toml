@@ -1,0 +1,9 @@
+[package]
+name = "miaudit-web"
+edition.workspace = true
+version.workspace = true
+build = "build.rs"
+
+[dependencies]
+axum = "0.8"
+rust-embed = { version = "8", features = ["debug-embed", "mime-guess"] }
