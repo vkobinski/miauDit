@@ -1,7 +1,7 @@
 use crate::{
     error::*,
     events::{self, Log},
-    git,
+    git, github, project,
     snapshot::{self, EXCLUDED_DIRS},
     store::{Config, Pending, Store},
 };
@@ -70,6 +70,7 @@ pub fn init(cwd: &Path) -> Res<Out> {
     let _ = fs::remove_file(&probe);
     let config = Config { schema_version: SCHEMA_VERSION.into(), repo_id: format!("repo_{}", uuid::Uuid::new_v4().simple()), created_at: now(), case_sensitive };
     let s = Store::init(&cwd, &config)?;
+    project::init(&s)?;
     ok(json!({"already_initialized": false, "repo_id": config.repo_id, "root": s.root, "case_sensitive": case_sensitive}))
 }
 
@@ -228,7 +229,7 @@ pub fn evidence_add(ctx: &Ctx, file: &str) -> Res<Out> {
         _ => unreachable!("validated"),
     };
     let digest = ctx.store.put_blob(&bytes)?;
-    let body = EvidenceBody { classification: input.classification, description: input.description, artifact: ArtifactRef { digest, size: bytes.len() as u64 }, decision_id: input.decision_id };
+    let body = EvidenceBody { classification: input.classification, description: input.description, artifact: ArtifactRef { digest, size: bytes.len() as u64 }, decision_id: input.decision_id, phase: input.phase, environment: input.environment };
     let (id, obj) = object_id("evd", DOMAIN_EVIDENCE, &Stored::self_reported("evidence", body))?;
     record(ctx, id, obj, |p| &mut p.evidence)
 }
@@ -244,24 +245,57 @@ fn git_baseline(root: &Path) -> GitBaseline {
     }
 }
 
-const UNAVAILABLE_CAPABILITIES: [&str; 7] = [
+const UNAVAILABLE_CAPABILITIES: [&str; 4] = [
     "conversation_capture",
     "agent_topology",
     "resource_access_receipts",
     "command_execution_receipts",
-    "developer_review_observation",
-    "signatures",
-    "local_encryption",
 ];
 
+fn unavailable_reason(name: &str) -> &'static str {
+    match name {
+        "conversation_capture" => "the conversation is not captured",
+        "agent_topology" => "which agents and subagents ran is not recorded",
+        "resource_access_receipts" => "file reads and network access are not recorded",
+        "command_execution_receipts" => "commands are not recorded",
+        _ => "not implemented",
+    }
+}
+
+fn partial_note(name: &str, s: &events::Summary) -> Option<String> {
+    match name {
+        "conversation_capture" if s.prompts > 0 || s.assistant_messages > 0 => Some(format!(
+            "partial (hook): {} user prompt(s) kept as blobs, {} assistant reply/transcript digest(s) only, no reply text stored",
+            s.prompts, s.assistant_messages
+        )),
+        "agent_topology" if !s.sessions.is_empty() || s.agent_events > 0 => Some(format!(
+            "partial (hook): {} session(s), {} subagent id(s), {} spawn/start/stop event(s); agents outside the hooks are not seen",
+            s.sessions.len(), s.agent_ids.len(), s.agent_events
+        )),
+        "resource_access_receipts" if s.resources > 0 => Some(format!(
+            "partial (hook): {} Read/Grep/Glob/Web/MCP call(s) as paths, hosts and digests; reads and network use inside shell commands are not seen",
+            s.resources
+        )),
+        "command_execution_receipts" if s.commands > 0 => Some(format!(
+            "partial (hook): {} command(s) as program, command digest, output digest and exit code when the agent reports it; no output text stored",
+            s.commands
+        )),
+        _ => None,
+    }
+}
+
 fn coverage(obs: &Observed) -> Vec<Capability> {
-    let mut c = vec![Capability { capability: "file_snapshot".into(), provenance: Provenance::SelfReported }];
-    for (name, n) in [("hook_user_prompts", obs.summary.prompts), ("hook_file_edits", obs.summary.edits), ("hook_command_digests", obs.summary.commands)] {
-        if n > 0 && obs.chain_error.is_none() {
-            c.push(Capability { capability: name.into(), provenance: Provenance::Observed });
+    let mut c = vec![Capability { capability: "file_snapshot".into(), provenance: Provenance::SelfReported, note: Some("captured by the local CLI, not a trusted harness".into()) }];
+    let trusted = obs.chain_error.is_none();
+    if trusted && obs.summary.edits > 0 {
+        c.push(Capability { capability: "hook_file_edits".into(), provenance: Provenance::Observed, note: Some("path and content digest after each edit tool call; shell changes are not seen".into()) });
+    }
+    for n in UNAVAILABLE_CAPABILITIES {
+        match partial_note(n, &obs.summary).filter(|_| trusted) {
+            Some(note) => c.push(Capability { capability: n.into(), provenance: Provenance::Observed, note: Some(note) }),
+            None => c.push(Capability { capability: n.into(), provenance: Provenance::Unavailable, note: Some(unavailable_reason(n).into()) }),
         }
     }
-    c.extend(UNAVAILABLE_CAPABILITIES.iter().map(|n| Capability { capability: (*n).into(), provenance: Provenance::Unavailable }));
     c
 }
 
@@ -312,12 +346,82 @@ fn observed_gaps(ctx: &Ctx, obs: &Observed) -> Res<Vec<Gap>> {
         g.push(gap("OBSERVED_EDIT_NOT_STAGED", "files edited since the last audit commit were not staged, so this audit does not cover them", unstaged));
     }
     if !obs.summary.audit_store_touched.is_empty() {
-        g.push(gap("AUDIT_STORE_TOUCHED_BY_TOOL", "an editing tool wrote inside .audit/ or .git/; the audit store is not meant to be edited", obs.summary.audit_store_touched.clone()));
+        g.push(gap("AUDIT_STORE_TOUCHED_BY_TOOL", "an editing tool wrote inside .miaudit/ or .git/; the audit store is not meant to be edited", obs.summary.audit_store_touched.clone()));
     }
     if obs.summary.capture_errors > 0 {
         g.push(gap("CAPTURE_ERRORS", "a hook delivered input that could not be recorded in full; events may be missing", vec![]));
     }
     Ok(g)
+}
+
+fn evidence_gaps(ctx: &Ctx, p: &Pending) -> Res<Vec<Gap>> {
+    let mut g = Vec::new();
+    let (base, cur) = ctx.current()?;
+    let has_changes = !diff_trees(&base, &cur).is_empty();
+    let mut kinds = BTreeSet::new();
+    for id in &p.contexts {
+        if let Some(c) = ctx.store.get_object::<ContextInput>(id)?
+            && let Some(k) = c.body.change_kind
+        {
+            kinds.insert(format!("{k:?}"));
+        }
+    }
+    if kinds.is_empty() {
+        if has_changes {
+            g.push(gap("CHANGE_KIND_UNDECLARED", "the context does not declare change_kind (frontend, api or other), so the evidence required for this kind of change cannot be checked", vec![]));
+        }
+        return Ok(g);
+    }
+    let mut evidence = Vec::new();
+    for id in &p.evidence {
+        if let Some(e) = ctx.store.get_evidence(id)? {
+            let image = ctx.store.get_blob(&e.body.artifact.digest)?.is_some_and(|b| miaudit_schema::media::image_mime(&b).is_some());
+            evidence.push((e.body, image));
+        }
+    }
+    let real_env = |e: &EvidenceBody| matches!(e.environment, Some(Environment::Local | Environment::Staging | Environment::Production));
+    for phase in [Phase::Before, Phase::After] {
+        let word = if phase == Phase::Before { "before" } else { "after" };
+        if kinds.contains("Frontend") && !evidence.iter().any(|(e, image)| e.phase == Some(phase) && real_env(e) && *image) {
+            g.push(gap(&format!("FRONTEND_EVIDENCE_MISSING:{word}"), &format!("no screenshot of the UI {word} the change; ask the developer for a print, or capture one with a browser or screenshot tool, and attach it as an image with phase={word} and environment=local, staging or production"), vec![word.into()]));
+        }
+        if kinds.contains("Api") && !evidence.iter().any(|(e, _)| e.phase == Some(phase) && real_env(e)) {
+            let what = if phase == Phase::Before { "the previous version of the code" } else { "the new version of the code" };
+            g.push(gap(&format!("API_EVIDENCE_MISSING:{word}"), &format!("no evidence of {what} run against the API; attach the real requests and responses with phase={word} and environment=local, staging or production, naming the commit or snapshot that was run"), vec![word.into()]));
+        }
+    }
+    Ok(g)
+}
+
+fn project_gaps(ctx: &Ctx) -> Vec<Gap> {
+    let st = project::status(&ctx.store);
+    match st.state {
+        "missing" => vec![gap("PROJECT_PROFILE_MISSING", "no .miaudit/PROJECT.md: ask the developer how to run the server, collect evidence and reach staging, and record it (miaudit project init)", vec![])],
+        "incomplete" => vec![gap("PROJECT_PROFILE_INCOMPLETE", "the project profile has unanswered sections; ask the developer and fill them in", st.incomplete.iter().map(|s| s.to_string()).collect())],
+        "contains_secret" => vec![gap("PROJECT_PROFILE_SECRET", "the project profile looks like it contains a secret value; replace it with an environment variable name", st.secrets.iter().map(|f| format!("line {}: {}", f.line, f.kind)).collect())],
+        _ => vec![],
+    }
+}
+
+pub fn project_init(ctx: &Ctx) -> Res<Out> {
+    let created = project::init(&ctx.store)?;
+    ok(json!({"path": project::path(&ctx.store), "created": created, "sections": project::SECTIONS.iter().map(|(h, _)| h).collect::<Vec<_>>(),
+        "note": "ask the developer each question, write the answers into the file, never secret values, then run `miaudit project check`"}))
+}
+
+pub fn project_check(ctx: &Ctx) -> Res<Out> {
+    let st = project::status(&ctx.store);
+    let exit = match st.state {
+        "complete" => 0,
+        "contains_secret" => EXIT_VALIDATION,
+        _ => EXIT_INSUFFICIENT_EVIDENCE,
+    };
+    Ok(Out {
+        value: json!({"path": project::path(&ctx.store), "state": st.state, "incomplete_sections": st.incomplete,
+            "secret_findings": st.secrets.iter().map(|f| json!({"line": f.line, "kind": f.kind})).collect::<Vec<_>>(),
+            "note": "secret detection is a heuristic on known token formats and labelled values; it does not prove the file is free of secrets"}),
+        exit,
+    })
 }
 
 fn gap(code: &str, message: &str, subjects: Vec<String>) -> Gap {
@@ -351,9 +455,15 @@ fn compute_gaps(ctx: &Ctx, p: &Pending, git: &GitBaseline) -> Res<Vec<Gap>> {
     if let GitBaseline::Unavailable { .. } = git {
         g.push(gap("GIT_BASELINE_UNAVAILABLE", "no Git baseline commit could be determined", vec![]));
     }
+    g.extend(project_gaps(ctx));
+    g.extend(evidence_gaps(ctx, p)?);
     g.extend(observed_gaps(ctx, &observed(ctx))?);
+    let obs_now = observed(ctx);
     for cap in UNAVAILABLE_CAPABILITIES {
-        g.push(gap(&format!("CAPTURE_UNAVAILABLE:{cap}"), "capture capability not available in this slice", vec![cap.into()]));
+        match partial_note(cap, &obs_now.summary).filter(|_| obs_now.chain_error.is_none()) {
+            Some(note) => g.push(gap(&format!("CAPTURE_PARTIAL:{cap}"), &note, vec![cap.into()])),
+            None => g.push(gap(&format!("CAPTURE_UNAVAILABLE:{cap}"), "capture capability not available in this slice", vec![cap.into()])),
+        }
     }
     g.push(gap("NO_HUMAN_APPROVAL", "no human disposition recorded; approvals are separate attestations", vec![]));
     Ok(g)
@@ -385,6 +495,7 @@ pub fn commit(ctx: &Ctx, message: &str) -> Res<Out> {
     }
     let git = git_baseline(&ctx.store.root);
     let config = ctx.store.config()?;
+    let author = github::resolve_author();
     let obs = observed(ctx);
     let mut evidence_ids = pending.evidence.clone();
     let mut last_seq = None;
@@ -397,6 +508,8 @@ pub fn commit(ctx: &Ctx, message: &str) -> Res<Out> {
             description: format!("hook-observed events seq {}..{} ({} events, hash-chained; first prev={}, last id={}); contains user prompt blob references", first.body.seq, last.body.seq, obs.events.len(), first.body.prev.as_deref().unwrap_or("none"), last.id),
             artifact: ArtifactRef { digest, size: bytes.len() as u64 },
             decision_id: None,
+            phase: None,
+            environment: None,
         };
         let (id, obj) = object_id("evd", DOMAIN_EVIDENCE, &Stored::observed("evidence", body))?;
         ctx.store.put_object(&id, &obj)?;
@@ -415,6 +528,7 @@ pub fn commit(ctx: &Ctx, message: &str) -> Res<Out> {
         description: message.into(),
         created: Created { at: now(), clock_authority: "local_device_unverified".into() },
         producer: Producer { tool: "miaudit-cli".into(), version: env!("CARGO_PKG_VERSION").into() },
+        author: Some(author.clone()),
         snapshot: Snapshot {
             id: sid.clone(),
             tree_digest: td,
@@ -431,7 +545,15 @@ pub fn commit(ctx: &Ctx, message: &str) -> Res<Out> {
         decision_ids: pending.decisions.clone(),
         evidence_ids,
         coverage: coverage(&obs),
-        gaps: compute_gaps(ctx, &pending, &git)?,
+        gaps: {
+            let mut g = compute_gaps(ctx, &pending, &git)?;
+            match author.provenance {
+                Provenance::Unavailable => g.push(gap("AUTHOR_UNAVAILABLE", &format!("no GitHub user could be recorded: {}", author.verification), vec![])),
+                Provenance::SelfReported => g.push(gap("AUTHOR_ASSERTED", "the GitHub user comes from MIAUDIT_GITHUB_USER and was not authenticated", vec![])),
+                _ => g.push(gap("AUTHOR_UNSIGNED", "the GitHub user comes from the local gh session; nothing is signed", vec![])),
+            }
+            g
+        },
     };
     let id = manifest.audit_id()?;
     ctx.store.put_commit(&id, &serde_json::to_vec_pretty(&manifest)?)?;
@@ -461,7 +583,7 @@ pub fn log(ctx: &Ctx) -> Res<Out> {
             Some(m) => {
                 queue.extend(m.parents.iter().cloned());
                 let linked: Vec<Value> = bindings.iter().filter(|b| b.body.audit_id == id).map(|b| json!({"git_commit": b.body.git.commit, "correspondence": b.body.correspondence})).collect();
-                out.push(json!({"audit_id": id, "created_at": m.created.at, "description": m.description, "parents": m.parents, "git": linked}));
+                out.push(json!({"audit_id": id, "created_at": m.created.at, "author": m.author.as_ref().and_then(|a| a.github_login.clone()), "description": m.description, "parents": m.parents, "git": linked}));
             }
             None => out.push(json!({"audit_id": id, "state": "unavailable_locally"})),
         }
@@ -603,6 +725,10 @@ pub fn verify(ctx: &Ctx, id: &str) -> Res<Out> {
 }
 
 pub fn bind(ctx: &Ctx, audit_id: &str, rev: &str, assert: bool) -> Res<Out> {
+    bind_inner(ctx, audit_id, rev, assert, true)
+}
+
+fn bind_inner(ctx: &Ctx, audit_id: &str, rev: &str, assert: bool, record: bool) -> Res<Out> {
     let m = ctx.store.get_commit(audit_id)?.ok_or_else(|| CliError::validation("OBJECT_NOT_FOUND", format!("{audit_id} not found")))?;
     let root = &ctx.store.root;
     let (commit, algorithm) = git::resolve_commit(root, rev)?;
@@ -636,7 +762,7 @@ pub fn bind(ctx: &Ctx, audit_id: &str, rev: &str, assert: bool) -> Res<Out> {
     };
     let binding_id = body.binding_id()?;
     let stored = StoredBinding { binding_id: binding_id.clone(), body, created: Created { at: now(), clock_authority: "local_device_unverified".into() } };
-    let created = ctx.store.put_binding(&binding_id, &serde_json::to_vec_pretty(&stored)?)?;
+    let created = if record { ctx.store.put_binding(&binding_id, &serde_json::to_vec_pretty(&stored)?)? } else { false };
     ok(json!({
         "binding_id": binding_id, "audit_id": audit_id, "duplicate": !created,
         "git_commit": stored.body.git.commit, "commit_web_url": stored.body.git.commit_web_url,
@@ -644,6 +770,60 @@ pub fn bind(ctx: &Ctx, audit_id: &str, rev: &str, assert: bool) -> Res<Out> {
         "paths": stored.body.paths,
         "note": "web link is derived from the origin remote; it does not prove the commit was pushed",
     }))
+}
+
+pub fn bind_pending(ctx: &Ctx, rev: &str) -> Res<Out> {
+    let bound: BTreeSet<String> = ctx.store.list_bindings()?.into_iter().map(|b| b.body.audit_id).collect();
+    let mut linked = Vec::new();
+    let mut skipped = Vec::new();
+    let mut queue: Vec<String> = ctx.store.head()?.into_iter().collect();
+    let mut seen = BTreeSet::new();
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let Some(m) = ctx.store.get_commit(&id)? else { continue };
+        queue.extend(m.parents.iter().cloned());
+        if bound.contains(&id) {
+            continue;
+        }
+        match bind_inner(ctx, &id, rev, false, false) {
+            Ok(Out { value, .. }) if value["correspondence"] == "full" => {
+                let done = bind_inner(ctx, &id, rev, false, true)?;
+                linked.push(json!({"audit_id": id, "correspondence": "full", "binding_id": done.value["binding_id"]}));
+            }
+            Ok(Out { value, .. }) => skipped.push(json!({"audit_id": id, "reason": format!("correspondence is {}; only full matches are linked automatically", value["correspondence"].as_str().unwrap_or("unknown"))})),
+            Err(e) => skipped.push(json!({"audit_id": id, "reason": e.code})),
+        }
+    }
+    ok(json!({"git_rev": rev, "linked": linked, "skipped": skipped,
+        "note": "audit commits that were already linked are left alone; a partial binding is recorded only by running `miaudit bind` yourself"}))
+}
+
+const POST_COMMIT_HOOK: &str = "#!/bin/sh\n\"$HOME/.cargo/bin/miaudit\" bind-pending --git-commit HEAD >/dev/null 2>&1 || true\n";
+
+pub fn git_hook_install(ctx: &Ctx) -> Res<Out> {
+    use std::os::unix::fs::PermissionsExt;
+    let o = Command::new("git").args(["rev-parse", "--git-path", "hooks/post-commit"]).current_dir(&ctx.store.root).output()
+        .map_err(|e| CliError::validation("GIT_UNAVAILABLE", format!("git could not be run: {e}")))?;
+    if !o.status.success() {
+        return Err(CliError::validation("NOT_A_GIT_REPOSITORY", "this directory is not inside a Git repository"));
+    }
+    let rel = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let path = ctx.store.root.join(&rel);
+    match fs::read_to_string(&path) {
+        Ok(existing) if existing == POST_COMMIT_HOOK => return ok(json!({"hook": path, "installed": true, "changed": false})),
+        Ok(_) => return Err(CliError::conflict("HOOK_EXISTS", format!("{} already exists with other content; not overwriting", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(&path, POST_COMMIT_HOOK)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    ok(json!({"hook": path, "installed": true, "changed": true,
+        "note": "after each git commit, audit commits that match it fully are linked; partial matches are never linked automatically"}))
 }
 
 pub fn bindings(ctx: &Ctx, audit_id: Option<&str>) -> Res<Out> {
@@ -682,7 +862,7 @@ pub fn events_status(ctx: &Ctx) -> Res<Out> {
                 "seq": e.body.seq, "id": e.id, "at": e.body.at, "hook": e.body.hook, "kind": e.body.kind, "tool": e.body.tool, "data": e.body.data,
             })).collect();
             ok(json!({"chain": "ok", "events_total": all.len(), "cursor": cursor, "events_since_last_audit_commit": pending.len(), "recent": recent,
-                "provenance": "observed", "note": "the chain proves internal consistency; whoever can write .audit/ can still rewrite the whole log and recompute it"}))
+                "provenance": "observed", "note": "the chain proves internal consistency; whoever can write .miaudit/ can still rewrite the whole log and recompute it"}))
         }
         Err(why) => Ok(Out { value: json!({"chain": "broken", "detail": why, "cursor": cursor}), exit: EXIT_VALIDATION }),
     }

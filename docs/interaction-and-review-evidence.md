@@ -116,7 +116,7 @@ Proposed API operations:
 
 Enforce producer restrictions per record variant; do not trust an input `role`, `origin`, `approved_by` or `verified` field. Reuse idempotency, strict schemas, reference checks and snapshot preconditions from the normalized API contract.
 
-Proposed CLI reads: `audit conversation <audit-id>`, `audit commands <audit-id>`, `audit permissions <audit-id>`, `audit files <audit-id>`, and `audit review-evidence <audit-id>`. Support text and versioned JSON output, restricted artifact access and explicit coverage indicators. No UI is required.
+Proposed CLI reads: `audit conversation <audit-id>`, `audit commands <audit-id>`, `audit permissions <audit-id>`, `audit files <audit-id>`, and `miaudit review-evidence <audit-id>`. Support text and versioned JSON output, restricted artifact access and explicit coverage indicators. No UI is required.
 
 Each audit manifest references a fixed set of conversation, authorization, execution and effect events. Later discoveries produce a superseding dossier or additional attestation, never a silent rewrite of reviewed history.
 

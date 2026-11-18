@@ -201,14 +201,136 @@ fn file_data(store: &Store, cwd: &Path, p: &str, operation: &str) -> Value {
             let digest = fs::symlink_metadata(&abs).ok().filter(|m| m.is_file()).and_then(|_| snapshot::capture(&abs, &rel).ok()).map(|(e, _)| e.digest);
             json!({"path": rel, "operation": operation, "digest_after": digest})
         }
+        Err(_) if p.ends_with(".miaudit/PROJECT.md") => {
+            json!({"project_profile_edit": true, "path_as_given": p, "operation": operation})
+        }
         Err(e) if e.rule.contains("excluded from capture") => {
-            json!({"touches_audit_store": p.contains(".audit"), "touches_git_dir": p.contains(".git"), "path_as_given": p})
+            json!({"touches_audit_store": p.contains(".miaudit"), "touches_git_dir": p.contains(".git"), "path_as_given": p})
         }
         Err(_) => json!({"outside_repo_or_unsupported": true, "path_as_given": p}),
     }
 }
 
 const MAX_PATCH_FILES: usize = 256;
+const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn short(v: Option<&str>) -> Option<String> {
+    v.map(|s| s.chars().take(128).collect())
+}
+
+fn text_digest(t: &str) -> Value {
+    json!({"digest": content_id(t.as_bytes()), "bytes": t.len() as u64})
+}
+
+pub fn output_receipt(resp: Option<&Value>) -> Value {
+    let Some(r) = resp else { return json!({"output_digest": null, "output_bytes": null, "exit_code": null}) };
+    let mut material = Vec::new();
+    let mut total = 0u64;
+    let mut push = |k: &str, v: &str| {
+        material.extend(k.as_bytes());
+        material.push(0);
+        material.extend(v.as_bytes());
+        material.push(0);
+        total += v.len() as u64;
+    };
+    let mut found = false;
+    match r {
+        Value::String(t) => {
+            push("output", t);
+            found = true;
+        }
+        Value::Object(m) => {
+            for k in ["stdout", "stderr", "output", "aggregated_output", "content"] {
+                if let Some(Value::String(t)) = m.get(k) {
+                    push(k, t);
+                    found = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    let exit = r.as_object().and_then(|m| ["exit_code", "exitCode", "returncode", "code"].iter().find_map(|k| m.get(*k).and_then(Value::as_i64)));
+    json!({
+        "output_digest": if found { Value::String(content_id(&material)) } else { Value::Null },
+        "output_bytes": if found { json!(total) } else { Value::Null },
+        "exit_code": exit,
+    })
+}
+
+fn url_host(u: &str) -> Option<String> {
+    let rest = u.split_once("://").map(|(_, r)| r)?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    let host = host.rsplit('@').next()?;
+    let host = host.split(':').next()?;
+    if host.is_empty() { None } else { Some(host.chars().take(253).collect()) }
+}
+
+fn resource_item(store: &Store, cwd: &Path, tool: &str, tin: &Value) -> Option<Value> {
+    match tool {
+        "Read" | "NotebookRead" => {
+            let p = str_field(tin, "file_path").or_else(|| str_field(tin, "notebook_path"))?;
+            let mut d = file_data(store, cwd, p, "read");
+            d["resource"] = json!("file");
+            Some(d)
+        }
+        "Grep" | "Glob" => {
+            let pat = str_field(tin, "pattern").unwrap_or("");
+            let base = str_field(tin, "path").unwrap_or("");
+            Some(json!({"resource": "search", "pattern_digest": content_id(pat.as_bytes()), "pattern_bytes": pat.len() as u64, "base_digest": content_id(base.as_bytes())}))
+        }
+        "WebFetch" => {
+            let u = str_field(tin, "url").unwrap_or("");
+            Some(json!({"resource": "web_fetch", "host": url_host(u), "url_digest": content_id(u.as_bytes())}))
+        }
+        "WebSearch" => {
+            let q = str_field(tin, "query").unwrap_or("");
+            Some(json!({"resource": "web_search", "query_digest": content_id(q.as_bytes()), "query_bytes": q.len() as u64}))
+        }
+        t if t.starts_with("mcp__") => {
+            let raw = serde_json::to_vec(tin).unwrap_or_default();
+            Some(json!({"resource": "mcp", "input_digest": content_id(&raw), "input_bytes": raw.len() as u64}))
+        }
+        _ => None,
+    }
+}
+
+fn spawn_item(tool: &str, tin: &Value) -> Option<Value> {
+    if !matches!(tool, "Task" | "Agent" | "spawn_agent") {
+        return None;
+    }
+    let kind = short(str_field(tin, "subagent_type").or_else(|| str_field(tin, "agent_type")));
+    let prompt = str_field(tin, "prompt").or_else(|| str_field(tin, "message")).unwrap_or("");
+    Some(json!({"action": "spawn", "agent_type": kind, "prompt_digest": content_id(prompt.as_bytes()), "prompt_bytes": prompt.len() as u64}))
+}
+
+fn transcript_receipt(input: &Value) -> Value {
+    let Some(path) = str_field(input, "transcript_path") else { return json!({"transcript_digest": null, "transcript_bytes": null}) };
+    use std::io::Read as _;
+    let Ok(f) = fs::File::open(path) else { return json!({"transcript_digest": null, "transcript_bytes": null}) };
+    let mut buf = Vec::new();
+    if f.take(MAX_TRANSCRIPT_BYTES + 1).read_to_end(&mut buf).is_err() || buf.len() as u64 > MAX_TRANSCRIPT_BYTES {
+        return json!({"transcript_digest": null, "transcript_bytes": null, "transcript_note": "unreadable or larger than the limit"});
+    }
+    json!({"transcript_digest": content_id(&buf), "transcript_bytes": buf.len() as u64})
+}
+
+pub fn capture_stop(store: &Store, input: &Value, agent: Agent) -> Res<Event> {
+    let hook = str_field(input, "hook_event_name").unwrap_or("Stop");
+    let session = short(str_field(input, "session_id"));
+    let msg = str_field(input, "last_assistant_message");
+    let mut data = transcript_receipt(input);
+    match msg {
+        Some(m) => {
+            data["message_digest"] = json!(content_id(m.as_bytes()));
+            data["message_bytes"] = json!(m.len() as u64);
+        }
+        None => {
+            data["message_digest"] = Value::Null;
+            data["message_bytes"] = Value::Null;
+        }
+    }
+    Log::new(store).append(agent.source(), hook, session, None, "assistant_message", data)
+}
 
 pub fn patch_files(text: &str) -> Vec<(&'static str, String)> {
     let mut out: Vec<(&'static str, String)> = Vec::new();
@@ -272,7 +394,11 @@ pub fn capture(store: &Store, cwd: &Path, input: &Value, agent: Agent) -> Res<Ve
         }
         (_, Some("Bash")) if post => {
             let interrupted = input.get("tool_response").and_then(|r| r.get("interrupted")).and_then(Value::as_bool);
-            items.push(("command", json!({"program": program_of(command_text), "command_digest": content_id(command_text.as_bytes()), "command_bytes": command_text.len() as u64, "failed": failed, "interrupted": interrupted})));
+            let mut d = json!({"program": program_of(command_text), "command_digest": content_id(command_text.as_bytes()), "command_bytes": command_text.len() as u64, "failed": failed, "interrupted": interrupted});
+            if let (Some(o), Some(r)) = (d.as_object_mut(), output_receipt(input.get("tool_response")).as_object()) {
+                o.extend(r.clone());
+            }
+            items.push(("command", d));
             for (op, path) in patch_files(command_text) {
                 let mut d = file_data(store, cwd, &path, op);
                 d["failed"] = json!(failed);
@@ -298,6 +424,30 @@ pub fn capture(store: &Store, cwd: &Path, input: &Value, agent: Agent) -> Res<Ve
             d["failed"] = json!(failed);
             items.push(("file_edit", d));
         }
+        (_, Some(t)) if post && spawn_item(t, tin).is_some() => {
+            let mut d = spawn_item(t, tin).unwrap_or_default();
+            d["failed"] = json!(failed);
+            items.push(("agent", d));
+        }
+        (_, Some(t)) if post && resource_item(store, cwd, t, tin).is_some() => {
+            let mut d = resource_item(store, cwd, t, tin).unwrap_or_default();
+            d["failed"] = json!(failed);
+            items.push(("resource_access", d));
+        }
+        ("SubagentStart" | "SubagentStop", _) => {
+            let mut d = json!({
+                "action": if hook == "SubagentStart" { "start" } else { "stop" },
+                "agent_id": short(str_field(input, "agent_id")),
+                "agent_type": short(str_field(input, "agent_type")),
+                "turn_id": short(str_field(input, "turn_id")),
+            });
+            if let Some(m) = str_field(input, "last_assistant_message") {
+                let t = text_digest(m);
+                d["message_digest"] = t["digest"].clone();
+                d["message_bytes"] = t["bytes"].clone();
+            }
+            items.push(("agent", d));
+        }
         _ if post => items.push(("tool_call", json!({"failed": failed}))),
         _ => items.push(("other_hook", json!({}))),
     }
@@ -317,6 +467,11 @@ pub struct Summary {
     pub prompts: usize,
     pub commands: usize,
     pub edits: usize,
+    pub assistant_messages: usize,
+    pub resources: usize,
+    pub agent_events: usize,
+    pub sessions: std::collections::BTreeSet<String>,
+    pub agent_ids: std::collections::BTreeSet<String>,
     pub last_digest: BTreeMap<String, Option<String>>,
     pub audit_store_touched: Vec<String>,
     pub capture_errors: usize,
@@ -325,7 +480,18 @@ pub struct Summary {
 pub fn summarize(events: &[Event]) -> Summary {
     let mut s = Summary::default();
     for e in events {
+        if let Some(sid) = &e.body.session_id {
+            s.sessions.insert(sid.clone());
+        }
         match e.body.kind.as_str() {
+            "assistant_message" => s.assistant_messages += 1,
+            "resource_access" => s.resources += 1,
+            "agent" => {
+                s.agent_events += 1;
+                if let Some(id) = e.body.data.get("agent_id").and_then(Value::as_str) {
+                    s.agent_ids.insert(id.to_string());
+                }
+            }
             "user_prompt" => s.prompts += 1,
             "command" => s.commands += 1,
             "capture_error" => s.capture_errors += 1,

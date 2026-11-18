@@ -25,6 +25,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/audit/{id}", get(detail))
+        .route("/audit/{id}/evidence/{eid}/image", get(evidence_image))
         .route("/api/audits", get(api_list))
         .route("/api/audits/{id}", get(api_detail))
         .fallback(|| async { page(StatusCode::NOT_FOUND, html::message("Not found", "No such page.")) })
@@ -41,7 +42,7 @@ async fn guard(State(s): State<Shared>, req: Request, next: Next) -> Response {
     }
     let mut res = next.run(req).await;
     let h = res.headers_mut();
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -73,6 +74,16 @@ async fn detail(State(s): State<Shared>, Path(id): Path<String>) -> Response {
             page(StatusCode::OK, html::detail(&view, &verification))
         }
         None => page(StatusCode::NOT_FOUND, html::message("Not found", "No such audit commit.")),
+    }
+}
+
+async fn evidence_image(State(s): State<Shared>, Path((id, eid)): Path<(String, String)>) -> Response {
+    if !data::valid_audit_id(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match data::Repo::open(&s.repo).ok().and_then(|r| r.evidence_image(&id, &eid)) {
+        Some((mime, bytes)) => ([(header::CONTENT_TYPE, mime), (header::CONTENT_DISPOSITION, "inline")], bytes).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

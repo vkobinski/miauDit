@@ -18,7 +18,7 @@ fn audit_bin() -> PathBuf {
 }
 
 fn run(dir: &Path, prog: &str, args: &[&str]) -> String {
-    let out = Command::new(prog).current_dir(dir).args(args).output().unwrap();
+    let out = Command::new(prog).env("MIAUDIT_GITHUB_USER", "test-user").current_dir(dir).args(args).output().unwrap();
     String::from_utf8(out.stdout).unwrap()
 }
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -71,7 +71,7 @@ async fn pages_render_and_escape_untrusted_content() {
         assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;"), "{uri}");
     }
     let (_, _, detail) = get(&app, "GET", &format!("/audit/{id}"), HOST).await;
-    for want in ["self-reported", "unverified", "integrity: pass", "none recorded", "not evaluated", "full match", "https://github.com/acme/repo/commit/", "match", "CAPTURE_UNAVAILABLE:signatures"] {
+    for want in ["self-reported", "unverified", "integrity: pass", "none recorded", "not evaluated", "full match", "https://github.com/acme/repo/commit/", "match", "CAPTURE_UNAVAILABLE:agent_topology", "@test-user", "GitHub user"] {
         assert!(detail.contains(want), "missing {want:?}");
     }
     let (_, _, index) = get(&app, "GET", "/", HOST).await;
@@ -120,7 +120,7 @@ async fn json_api_and_tampering_is_visible() {
     assert_eq!(s, StatusCode::OK);
     assert!(raw.contains("\"snapshot\""));
 
-    let path = d.path().join(format!(".audit/commits/{id}.json"));
+    let path = d.path().join(format!(".miaudit/commits/{id}.json"));
     let text = fs::read_to_string(&path).unwrap().replace("staged_paths_only", "staged_paths_onlx");
     fs::write(&path, text).unwrap();
     let (_, _, detail) = get(&app, "GET", &format!("/audit/{id}"), HOST).await;
@@ -133,4 +133,46 @@ async fn uninitialized_repo_reports_a_clear_error() {
     let (s, _, body) = get(&app(&d), "GET", "/", HOST).await;
     assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(body.contains("not an initialized audit repository"));
+}
+
+#[tokio::test]
+async fn screenshot_evidence_is_rendered_and_only_real_images_are_served() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path();
+    let a = audit_bin();
+    let a = a.to_str().unwrap();
+    run(p, a, &["init"]);
+    fs::write(p.join("f.txt"), "x").unwrap();
+    run(p, a, &["add", "f.txt"]);
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    png.extend_from_slice(b"pixels");
+    fs::write(p.join("shot.png"), &png).unwrap();
+    fs::write(p.join("svg.png"), "<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>").unwrap();
+    fs::write(p.join("e1.json"), r#"{"schema_version":"1","classification":"internal","description":"screenshot","file":"shot.png","phase":"after","environment":"staging"}"#).unwrap();
+    fs::write(p.join("e2.json"), r#"{"schema_version":"1","classification":"internal","description":"fake","file":"svg.png"}"#).unwrap();
+    let e1 = serde_json::from_str::<serde_json::Value>(&run(p, a, &["--json", "evidence", "add", "--file", "e1.json"])).unwrap()["result"]["id"].as_str().unwrap().to_string();
+    let e2 = serde_json::from_str::<serde_json::Value>(&run(p, a, &["--json", "evidence", "add", "--file", "e2.json"])).unwrap()["result"]["id"].as_str().unwrap().to_string();
+    let id = serde_json::from_str::<serde_json::Value>(&run(p, a, &["--json", "commit", "-m", "shots"])).unwrap()["result"]["audit_id"].as_str().unwrap().to_string();
+    let app = app(&d);
+
+    let (s, _, page) = get(&app, "GET", &format!("/audit/{id}"), HOST).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(page.contains(&format!("src=\"/audit/{id}/evidence/{e1}/image\"")));
+    assert!(!page.contains(&format!("evidence/{e2}/image")));
+    assert!(page.contains("Staging") && page.contains("After"));
+
+    let req = Request::builder().uri(format!("/audit/{id}/evidence/{e1}/image")).header("host", HOST).body(Body::empty()).unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "image/png");
+    assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+    assert!(res.headers()["content-security-policy"].to_str().unwrap().contains("img-src 'self'"));
+    assert_eq!(res.into_body().collect().await.unwrap().to_bytes().to_vec(), png);
+
+    let (s, _, _) = get(&app, "GET", &format!("/audit/{id}/evidence/{e2}/image"), HOST).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "content that is not an image must never be served");
+    let (s, _, _) = get(&app, "GET", &format!("/audit/{id}/evidence/evd_{}/image", "0".repeat(64)), HOST).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _, _) = get(&app, "GET", &format!("/audit/{id}/evidence/{e1}/image"), "evil.example").await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
 }
