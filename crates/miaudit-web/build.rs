@@ -30,12 +30,12 @@ fn main() {
     let web = manifest.join("../../web");
     let dist = web.join("dist");
     let index = dist.join("index.html");
-    for p in ["src", "index.html", "package.json", "package-lock.json", "vite.config.ts", "tsconfig.json"] {
+    for p in ["src", "public", "index.html", "package.json", "package-lock.json", "vite.config.ts", "tsconfig.json"] {
         println!("cargo:rerun-if-changed={}", web.join(p).display());
     }
     println!("cargo:rerun-if-env-changed=MIAUDIT_SKIP_WEB_BUILD");
 
-    let sources = ["src", "index.html", "package.json", "package-lock.json", "vite.config.ts", "tsconfig.json"].iter().filter_map(|p| newest(&web.join(p))).max();
+    let sources = ["src", "public", "index.html", "package.json", "package-lock.json", "vite.config.ts", "tsconfig.json"].iter().filter_map(|p| newest(&web.join(p))).max();
     let built = fs::metadata(&index).and_then(|m| m.modified()).ok();
     let fresh = matches!((built, sources), (Some(b), Some(s)) if b >= s);
     let skip = env::var_os("MIAUDIT_SKIP_WEB_BUILD").is_some();

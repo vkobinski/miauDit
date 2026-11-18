@@ -13,7 +13,10 @@ export function Layout({ mode }: { mode: "server" | "local" }) {
     <>
       <div className="topbar">
         <div className="in">
-          <Link to="/">miauDit</Link>
+          <Link to="/" className="brand">
+            <img className="brand-icon" src="/icon-64.png" width={32} height={32} alt="" />
+            miauDit
+          </Link>
           <span className="brandsub">{mode === "local" ? "local read-only viewer" : "audit commits for AI-assisted changes"}</span>
           {mode === "server" && (
             <form className="search" onSubmit={submit} role="search">
