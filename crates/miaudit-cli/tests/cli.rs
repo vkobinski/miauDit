@@ -229,7 +229,10 @@ fn commit_manifest_exposes_gaps_and_unverified_provenance() {
     assert_eq!(m["snapshot"]["verification"], "unverified_client_snapshot");
     let unavailable = m["coverage"].as_array().unwrap().iter().filter(|c| c["provenance"] == "unavailable").count();
     assert_eq!(unavailable, 4);
-    assert!(m["gaps"].as_array().unwrap().iter().any(|g| g["code"] == "CAPTURE_UNAVAILABLE:agent_topology"));
+    let topo = m["gaps"].as_array().unwrap().iter().find(|g| g["code"] == "CAPTURE_UNAVAILABLE:agent_topology").expect("gap present");
+    let msg = topo["message"].as_str().unwrap();
+    assert!(msg.contains("no hook events exist since the last audit commit"), "{msg}");
+    assert!(!msg.contains("in this slice"), "{msg}");
     let text = m.to_string();
     for forbidden in ["approved_by", "audit_id", "signature\""] {
         assert!(!text.contains(forbidden), "{forbidden}");

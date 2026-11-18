@@ -180,6 +180,9 @@ fn commit_attaches_observed_events_and_verify_checks_the_chain() {
     assert!(codes.contains(&"CAPTURE_PARTIAL:conversation_capture"));
     assert!(codes.contains(&"CAPTURE_UNAVAILABLE:command_execution_receipts"));
     assert!(!codes.contains(&"CAPTURE_UNAVAILABLE:conversation_capture"));
+    let cmd_gap = m["gaps"].as_array().unwrap().iter().find(|g| g["code"] == "CAPTURE_UNAVAILABLE:command_execution_receipts").unwrap();
+    let msg = cmd_gap["message"].as_str().unwrap();
+    assert!(msg.contains("hook event(s) were captured") && msg.contains("shell commands"), "{msg}");
     let evid = shown["result"]["objects"]["evidence"].as_array().unwrap();
     assert_eq!(evid.len(), 1);
     assert_eq!(evid[0]["object"]["provenance"], "observed");
