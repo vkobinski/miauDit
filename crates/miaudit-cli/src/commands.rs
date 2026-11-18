@@ -308,6 +308,22 @@ fn partial_note(name: &str, s: &events::Summary) -> Option<String> {
     }
 }
 
+fn unavailable_gap_message(cap: &str, obs: &Observed) -> String {
+    if let Some(e) = &obs.chain_error {
+        return format!("not recorded: the hook event log failed its integrity check ({e}), so none of its events were used; see EVENT_CHAIN_BROKEN");
+    }
+    if obs.events.is_empty() {
+        return "not recorded: no hook events exist since the last audit commit; the Claude Code or Codex hooks are not installed in this repository or did not fire (check `miaudit events` and the hooks in .claude/settings.json)".into();
+    }
+    let needs = match cap {
+        "conversation_capture" => "user prompts or assistant replies",
+        "agent_topology" => "sessions or subagent events",
+        "resource_access_receipts" => "Read, Grep, Glob, Web or MCP calls",
+        _ => "shell commands",
+    };
+    format!("not recorded: {} hook event(s) were captured since the last audit commit, but none of the kind this needs ({needs})", obs.events.len())
+}
+
 fn coverage(obs: &Observed) -> Vec<Capability> {
     let mut c = vec![Capability { capability: "file_snapshot".into(), provenance: Provenance::SelfReported, note: Some("captured by the local CLI, not a trusted harness".into()) }];
     let trusted = obs.chain_error.is_none();
@@ -486,7 +502,7 @@ fn compute_gaps(ctx: &Ctx, p: &Pending, git: &GitBaseline) -> Res<Vec<Gap>> {
     for cap in UNAVAILABLE_CAPABILITIES {
         match partial_note(cap, &obs_now.summary).filter(|_| obs_now.chain_error.is_none()) {
             Some(note) => g.push(gap(&format!("CAPTURE_PARTIAL:{cap}"), &note, vec![cap.into()])),
-            None => g.push(gap(&format!("CAPTURE_UNAVAILABLE:{cap}"), "capture capability not available in this slice", vec![cap.into()])),
+            None => g.push(gap(&format!("CAPTURE_UNAVAILABLE:{cap}"), &unavailable_gap_message(cap, &obs_now), vec![cap.into()])),
         }
     }
     g.push(gap("NO_HUMAN_APPROVAL", "no human disposition recorded; approvals are separate attestations", vec![]));

@@ -25,6 +25,9 @@ A context can declare `change_kind` (`frontend`, `api`, `other`) and evidence ca
 ## Store and author
 Each repository has a `.miaudit/` directory at its root (found by walking up, like `.git`) that ignores itself through `.miaudit/.gitignore`. Each audit commit records the GitHub user in `author`: `gh api user` login and id (`derived`), `MIAUDIT_GITHUB_USER` (`self_reported`), or `unavailable`. It is not signed.
 
+## Why a capture capability is unavailable
+`CAPTURE_UNAVAILABLE:<capability>` now says why, from what the audit commit saw: no hook events at all since the last audit commit (hooks not installed or not firing), the event log failed its integrity check, or events exist but none of the kind that capability needs (for example no shell commands for `command_execution_receipts`). Audit commits made before this wording keep the old text, because the gap is part of the manifest and its ID.
+
 ## Hook capture
 `miaudit init` creates `.miaudit/` and links the Claude Code hooks: the bundled `claude-code.settings.json` is merged into `.claude/settings.json` (`--local` for `settings.local.json`, `--no-hooks` to skip). Existing settings and other hooks are kept, commands already present are not duplicated, an unchanged file is not rewritten, and a settings file that is not a JSON object stops `init` before anything is created. The hooks call `$HOME/.cargo/bin/miaudit`; `init` warns when that binary is missing. Codex hooks are still copied by hand.
 
