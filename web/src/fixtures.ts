@@ -47,6 +47,7 @@ export function detail(overrides: Partial<AuditDetail> = {}): AuditDetail {
       {
         id: `dec_${"2".repeat(64)}`,
         object: { kind: "decision", schema_version: "1", provenance: "self_reported", body: { question: "q?", choice: "c", alternatives: ["x"], rationale: "r", risks: [], snapshot_id: SNAPSHOT_ID, evidence_links: [] } },
+        superseded_by: [],
       },
     ],
     evidence: [

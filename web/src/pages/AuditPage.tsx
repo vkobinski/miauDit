@@ -279,8 +279,13 @@ export function AuditView({ slug, d }: { slug: string; d: AuditDetail }) {
           x.object ? (
             <div className="item" key={x.id}>
               <div>
-                <ProvBadge p={x.object.provenance} /> {x.object.body.snapshot_id === s.id ? <Badge kind="ok">matches snapshot</Badge> : <Badge kind="bad">different snapshot</Badge>} <span className="mono muted">{short(x.id)}</span>
+                <ProvBadge p={x.object.provenance} /> {x.object.body.snapshot_id === s.id ? <Badge kind="ok">matches snapshot</Badge> : <Badge kind="bad">different snapshot</Badge>} {x.superseded_by.length > 0 && <Badge kind="warn">superseded</Badge>} <span className="mono muted">{short(x.id)}</span>
               </div>
+              {x.superseded_by.map((n) => (
+                <p className="small" key={n.decision_id}>
+                  Superseded by <span className="mono">{short(n.decision_id)}</span> in <Link to={`/${slug}/audit/${n.audit_id}`}>{short(n.audit_id)}</Link>. This record is unchanged; read the newer one for the current position.
+                </p>
+              ))}
               <p>
                 <b>{x.object.body.question}</b>
               </p>
@@ -296,6 +301,11 @@ export function AuditView({ slug, d }: { slug: string; d: AuditDetail }) {
                 <Kv k="Evidence links">
                   <BulletList items={x.object.body.evidence_links.map((l) => `${l.relation} → ${l.evidence_id}`)} />
                 </Kv>
+                {(x.object.body.supersedes ?? []).length > 0 && (
+                  <Kv k="Supersedes">
+                    <BulletList items={x.object.body.supersedes ?? []} />
+                  </Kv>
+                )}
               </div>
             </div>
           ) : (

@@ -13,6 +13,8 @@ pub struct Config {
     pub repo_id: String,
     pub created_at: String,
     pub case_sensitive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -96,6 +98,9 @@ impl Store {
 
     pub fn config(&self) -> Res<Config> {
         self.read_json("config.json")?.ok_or_else(|| CliError::validation("NOT_INITIALIZED", "missing config"))
+    }
+    pub fn save_config(&self, c: &Config) -> Res<()> {
+        write_atomic(&self.dir.join("config.json"), &serde_json::to_vec_pretty(c)?)
     }
     pub fn index(&self) -> Res<Index> {
         Ok(self.read_json("index.json")?.unwrap_or_default())

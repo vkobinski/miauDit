@@ -27,6 +27,8 @@ pub struct Repo {
     pub unreadable: usize,
 }
 
+pub type Superseded = std::collections::BTreeMap<String, Vec<(String, String)>>;
+
 pub struct Item<T> {
     pub id: String,
     pub object: Option<Stored<T>>,
@@ -113,6 +115,19 @@ impl Repo {
         }
         let mime = miaudit_schema::media::image_mime(&bytes)?;
         Some((mime, bytes))
+    }
+
+    pub fn superseded_by(&self, decision_ids: &[String]) -> Superseded {
+        let mut out = Superseded::new();
+        for s in &self.summaries {
+            for did in &s.manifest.decision_ids {
+                let Some(d) = self.object::<DecisionInput>("decisions", did) else { continue };
+                for old in d.body.supersedes.iter().filter(|o| decision_ids.contains(o)) {
+                    out.entry(old.clone()).or_default().push((did.clone(), s.id.clone()));
+                }
+            }
+        }
+        out
     }
 
     pub fn load(&self, id: &str) -> Option<View> {

@@ -99,7 +99,7 @@ eq "integrity passes" "$(echo "$vr" | jget result.verified.integrity)" pass
 echo "$vr" | grep -q observed_events_chain; check "verify checks the observed event chain" $?
 show=$($M show "$AID" --json)
 eq "observed evidence is attached" "$(echo "$show" | python3 -c "import json,sys;o=json.load(sys.stdin)['result']['objects']['evidence'];print(sorted(e['object']['provenance'] for e in o))")" "['observed', 'self_reported']"
-eq "stop-check is quiet after the audit commit" "$(printf '{"hook_event_name":"Stop"}' | $M stop-check >/dev/null 2>&1; echo $?)" 0
+eq "stop-check is quiet after the audit commit" "$(printf '{"hook_event_name":"Stop"}' | MIAUDIT_CHECKPOINT=0 $M stop-check >/dev/null 2>&1; echo $?)" 0
 
 if gh auth status >/dev/null 2>&1; then
   eq "author provenance is derived from gh" "$(echo "$show" | jget result.manifest.author.provenance)" derived
@@ -155,7 +155,7 @@ cap "$(printf '{"hook_event_name":"PostToolUse","session_id":"s","cwd":"%s","too
 cap "$(printf '{"hook_event_name":"PostToolUse","session_id":"s","cwd":"%s","tool_name":"WebFetch","tool_input":{"url":"https://docs.example.com/p?token=E2E-URL-SECRET"},"tool_response":{}}' "$W")"
 cap "$(printf '{"hook_event_name":"PostToolUse","session_id":"s","cwd":"%s","tool_name":"Task","tool_input":{"subagent_type":"reviewer","prompt":"E2E-PROMPT-SECRET"},"tool_response":{}}' "$W")"
 cap "$(printf '{"hook_event_name":"SubagentStart","session_id":"s","agent_id":"ag-1","agent_type":"reviewer"}' )"
-printf '{"hook_event_name":"Stop","session_id":"s","last_assistant_message":"E2E-REPLY-SECRET","stop_hook_active":true}' | $M stop-check >/dev/null 2>&1; eq "stop-check records the assistant message and lets the agent stop" $? 0
+printf '{"hook_event_name":"Stop","session_id":"s","last_assistant_message":"E2E-REPLY-SECRET","stop_hook_active":true}' | MIAUDIT_CHECKPOINT=0 $M stop-check >/dev/null 2>&1; eq "stop-check records the assistant message and lets the agent stop" $? 0
 if grep -q -e E2E-OUTPUT-SECRET -e E2E-URL-SECRET -e E2E-PROMPT-SECRET -e E2E-REPLY-SECRET .miaudit/events.jsonl; then check "no output, URL query, prompt or reply text in the event log" 1; else check "no output, URL query, prompt or reply text in the event log" 0; fi
 grep -q '"exit_code":7' .miaudit/events.jsonl; check "command exit code is recorded" $?
 grep -q '"host":"docs.example.com"' .miaudit/events.jsonl; check "web fetch records only the host" $?
@@ -191,6 +191,25 @@ code=$(curl -s -o img.out -w '%{http_code}:%{content_type}' "http://127.0.0.1:$P
 eq "viewer serves the screenshot as image/png" "$code" "200:image/png"
 cmp -s img.out shot.png; check "served screenshot is byte-identical to the attached file" $?
 eq "viewer API flags the screenshot as an image" "$(curl -s "http://127.0.0.1:$PORT/$VSLUG/api/audits/$AID2/detail" | python3 -c "import json,sys;print(any(e['image'] for e in json.load(sys.stdin)['evidence']))")" True
+
+
+BEFORE=$($M log --json | python3 -c "import json,sys;print(len(json.load(sys.stdin)['result']['commits']))")
+cap '{"hook_event_name":"UserPromptSubmit","session_id":"s2","prompt":"ask a question"}'
+cap "$(printf '{"hook_event_name":"PostToolUse","session_id":"s2","cwd":"%s","tool_name":"Bash","tool_input":{"command":"kubectl get pods"},"tool_response":{"stdout":"E2E-CHECKPOINT-SECRET","exit_code":0}}' "$W")"
+out=$(printf '{"hook_event_name":"Stop","session_id":"s2","last_assistant_message":"answer"}' | MIAUDIT_GITHUB_USER=e2e $M stop-check 2>&1 >/dev/null); rc=$?
+eq "stop-check exits 0 and records a checkpoint when a turn had only commands and conversation" $rc 0
+printf '%s' "$out" | grep -q "checkpoint audit_"; check "stop-check reports the checkpoint it recorded" $?
+AFTER=$($M log --json | python3 -c "import json,sys;print(len(json.load(sys.stdin)['result']['commits']))")
+eq "the checkpoint adds exactly one audit commit" "$AFTER" "$((BEFORE+1))"
+CPID=$($M log --json | python3 -c "import json,sys;print(json.load(sys.stdin)['result']['commits'][0]['audit_id'])")
+$M show "$CPID" --json | grep -q "AUTO_CHECKPOINT"; check "the checkpoint carries the AUTO_CHECKPOINT gap" $?
+$M verify "$CPID" --json >/dev/null; eq "the checkpoint verifies" $? 0
+grep -rq "E2E-CHECKPOINT-SECRET\|kubectl get pods" .miaudit/blobs; [ $? -ne 0 ]; check "the checkpoint stores no command text or output" $?
+$M checkpoints off --json >/dev/null
+cap '{"hook_event_name":"UserPromptSubmit","session_id":"s2","prompt":"another"}'
+printf '{"hook_event_name":"Stop","session_id":"s2"}' | $M stop-check >/dev/null 2>&1
+eq "no checkpoint is recorded while checkpoints are off" "$($M log --json | python3 -c "import json,sys;print(len(json.load(sys.stdin)['result']['commits']))")" "$AFTER"
+$M checkpoints on --json >/dev/null
 
 if [ -n "${MIAUDIT_TEST_MONGO_URI:-}" ] && [ -x "$SRV" ]; then
   SPORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])")

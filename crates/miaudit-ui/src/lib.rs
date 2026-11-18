@@ -200,7 +200,8 @@ async fn detail(State(s): State<Shared>, Path((owner, name, id)): Path<(String, 
     match repo.load(&id) {
         Some(view) => {
             let verification = data::verify_with_cli(&s.audit_bin, &s.repo, &id);
-            Json(api::detail_json(&view, &verification)).into_response()
+            let ids: Vec<String> = view.decisions.iter().map(|d| d.id.clone()).collect();
+            Json(api::detail_json(&view, &verification, &repo.superseded_by(&ids))).into_response()
         }
         None => error(StatusCode::NOT_FOUND, "NOT_FOUND", "no such audit commit"),
     }
