@@ -57,6 +57,8 @@ pub struct AuditDoc {
     pub author_login: Option<String>,
     pub changes: i64,
     pub gaps: i64,
+    #[serde(default)]
+    pub gap_codes: Vec<String>,
     pub parents: Vec<String>,
     pub received_at: String,
 }
@@ -112,6 +114,7 @@ pub struct RepoStats {
 
 #[derive(Clone)]
 pub struct Db {
+    name: String,
     repos: Collection<RepoDoc>,
     audits: Collection<AuditDoc>,
     objects: Collection<ObjectDoc>,
@@ -138,6 +141,10 @@ pub fn hash_token(token: &str) -> String {
 }
 
 impl Db {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub async fn connect(uri: &str, name: &str) -> R<Db> {
         let client = Client::with_uri_str(uri).await?;
         Self::open(client.database(name)).await
@@ -145,6 +152,7 @@ impl Db {
 
     pub async fn open(db: Database) -> R<Db> {
         let s = Db {
+            name: db.name().to_string(),
             repos: db.collection("repos"),
             audits: db.collection("audits"),
             objects: db.collection("objects"),
@@ -164,8 +172,21 @@ impl Db {
         s.blobs.create_indexes([idx(doc! {"repo_id": 1, "digest": 1}, true)]).await?;
         s.bindings.create_indexes([idx(doc! {"repo_id": 1, "binding_id": 1}, true), idx(doc! {"repo_id": 1, "audit_id": 1}, false)]).await?;
         s.tokens.create_indexes([idx(doc! {"hash": 1}, true), idx(doc! {"name": 1}, true)]).await?;
+        s.backfill_gap_codes().await?;
         Ok(s)
     }
+
+    async fn backfill_gap_codes(&self) -> R<()> {
+        let old: Vec<AuditDoc> = self.audits.find(doc! {"gap_codes": {"$exists": false}}).await?.try_collect().await?;
+        for a in old {
+            if let Ok(m) = serde_json::from_str::<Manifest>(&a.raw) {
+                let codes: Vec<String> = m.gaps.iter().map(|g| g.code.clone()).collect();
+                self.audits.update_one(doc! {"repo_id": &a.repo_id, "audit_id": &a.audit_id}, doc! {"$set": {"gap_codes": codes}}).await?;
+            }
+        }
+        Ok(())
+    }
+
 
     pub async fn create_token(&self, name: &str, token: &str) -> R<()> {
         let d = TokenDoc { name: name.into(), hash: hash_token(token), created_at: now(), revoked: false };
@@ -299,6 +320,7 @@ impl Db {
             author_login: m.author.as_ref().and_then(|a| a.github_login.clone()),
             changes: m.snapshot.changes.len() as i64,
             gaps: m.gaps.len() as i64,
+            gap_codes: m.gaps.iter().map(|g| g.code.clone()).collect(),
             parents: m.parents.clone(),
             received_at: now(),
         };
@@ -362,10 +384,13 @@ impl Db {
     }
 
 
-    pub async fn audit_page(&self, repo_id: &str, author: Option<&str>, page: u64) -> R<(Vec<AuditDoc>, i64)> {
+    pub async fn audit_page(&self, repo_id: &str, author: Option<&str>, gap: Option<&str>, page: u64) -> R<(Vec<AuditDoc>, i64)> {
         let mut filter = doc! {"repo_id": repo_id};
         if let Some(a) = author.filter(|a| !a.is_empty()) {
             filter.insert("author_login", a);
+        }
+        if let Some(g) = gap.filter(|g| !g.is_empty()) {
+            filter.insert("gap_codes", doc! {"$regex": format!("^{}", regex_escape(g))});
         }
         let total = self.audits.count_documents(filter.clone()).await? as i64;
         let rows = self

@@ -217,6 +217,15 @@ if [ -n "${MIAUDIT_TEST_MONGO_URI:-}" ] && [ -x "$SRV" ]; then
   cmp -s raw.out ".miaudit/commits/$AID2.json"; check "server returns the exact manifest bytes" $?
   code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data '{"x":1}' "http://127.0.0.1:$SPORT/api/v1/repos/$(jget result.repo_id < push1.out)/commits/audit_$(printf '0%.0s' $(seq 1 64))")
   eq "server refuses a commit whose content does not hash to its id" "$code" 422
+  $M remote --server "http://127.0.0.1:$SPORT" repos --json > qrepos.out; eq "remote repos exits 0" $? 0
+  eq "remote repos lists the pushed slug" "$(jget result.repos.0.slug < qrepos.out)" "$SLUG"
+  $M remote --server "http://127.0.0.1:$SPORT" audits "$SLUG" --gap NO_HUMAN_APPROVAL --json > qaudits.out; eq "remote audits exits 0" $? 0
+  eq "every audit has the no-human-approval gap" "$(jget result.total < qaudits.out)" "$OFFERED"
+  $M remote --server "http://127.0.0.1:$SPORT" audits "$SLUG" --gap NO_SUCH_GAP_CODE --json > qnone.out
+  eq "an unmatched gap filter returns nothing" "$(jget result.total < qnone.out)" 0
+  $M remote --server "http://127.0.0.1:$SPORT" audits "$SLUG" | grep -q "audit commit(s) match in $SLUG"; check "remote audits prints a readable table without --json" $?
+  $M remote --server "http://127.0.0.1:$SPORT" show "$SLUG" "$AID2" --json > qshow.out; eq "remote show exits 0" $? 0
+  eq "remote show returns the manifest description" "$(jget result.manifest.description < qshow.out)" "frontend change"
   $SRV token revoke e2e >/dev/null 2>&1
   MIAUDIT_SERVER="http://127.0.0.1:$SPORT" MIAUDIT_TOKEN="$TOKEN" $M push --json > push3.out; eq "revoked token cannot push (exit 2)" $? 2
   unset MIAUDIT_MONGO_URI MIAUDIT_MONGO_DB

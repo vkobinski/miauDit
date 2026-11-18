@@ -204,6 +204,7 @@ async fn api_repos(State(s): State<Shared>) -> Response {
 struct RepoQuery {
     page: Option<u64>,
     author: Option<String>,
+    gap: Option<String>,
 }
 
 async fn find_repo(s: &Shared, owner: &str, name: &str) -> Result<db::RepoDoc, Response> {
@@ -225,7 +226,7 @@ async fn repo_page(State(s): State<Shared>, Path((owner, name)): Path<(String, S
     };
     let page = q.page.unwrap_or(1).max(1);
     let result = async {
-        let (audits, total) = s.db.audit_page(&repo.repo_id, q.author.as_deref(), page).await?;
+        let (audits, total) = s.db.audit_page(&repo.repo_id, q.author.as_deref(), None, page).await?;
         let ids: Vec<String> = audits.iter().map(|a| a.audit_id.clone()).collect();
         let bindings = s.db.bindings_for(&repo.repo_id, &ids).await?;
         let authors = s.db.authors(&repo.repo_id).await?;
@@ -277,10 +278,19 @@ async fn api_audits(State(s): State<Shared>, Path((owner, name)): Path<(String, 
         Ok(r) => r,
         Err(r) => return r,
     };
-    match s.db.audit_page(&repo.repo_id, q.author.as_deref(), q.page.unwrap_or(1).max(1)).await {
-        Ok((audits, total)) => Json(json!({"repo": repo.slug, "total": total, "audits": audits.iter().map(|a| json!({
+    let page = q.page.unwrap_or(1).max(1);
+    let result = async {
+        let (audits, total) = s.db.audit_page(&repo.repo_id, q.author.as_deref(), q.gap.as_deref(), page).await?;
+        let ids: Vec<String> = audits.iter().map(|a| a.audit_id.clone()).collect();
+        let bindings = s.db.bindings_for(&repo.repo_id, &ids).await?;
+        Ok::<_, DbError>((audits, total, bindings))
+    }
+    .await;
+    match result {
+        Ok((audits, total, bindings)) => Json(json!({"repo": repo.slug, "total": total, "page": page, "per_page": db::PAGE_SIZE, "audits": audits.iter().map(|a| json!({
             "audit_id": a.audit_id, "created_at": a.created_at, "description": a.description, "author": a.author_login,
-            "changes": a.changes, "gaps": a.gaps, "parents": a.parents,
+            "changes": a.changes, "gaps": a.gaps, "gap_codes": a.gap_codes, "parents": a.parents,
+            "git": bindings.iter().filter(|b| b.body.audit_id == a.audit_id).map(|b| json!({"commit": b.body.git.commit, "correspondence": b.body.correspondence})).collect::<Vec<_>>(),
         })).collect::<Vec<_>>()}))
         .into_response(),
         Err(e) => db_error(e),
